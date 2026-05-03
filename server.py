@@ -71,6 +71,31 @@ def haversine(lat1, lon1, lat2, lon2):
     a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
     return round(EARTH_RADIUS_KM * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a)), 1)
 
+def geocode_country(country: str):
+    """Get approximate coordinates for a country using Nominatim."""
+    try:
+        resp = httpx.get("https://nominatim.openstreetmap.org/search", params={
+            "q": country, "format": "json", "limit": 1
+        }, headers={"User-Agent": "HavenApp/1.0"}, timeout=5)
+        if resp.status_code == 200 and resp.json():
+            data = resp.json()[0]
+            return float(data["lat"]), float(data["lon"])
+    except: pass
+    # Hardcoded fallback
+    country_coords = {
+        "South Africa": (-30.5595, 22.9375),
+        "United States": (37.0902, -95.7129),
+        "United Kingdom": (55.3781, -3.4360),
+        "Canada": (56.1304, -106.3468),
+        "Australia": (-25.2744, 133.7751),
+        "India": (20.5937, 78.9629),
+        "Nigeria": (9.0820, 8.6753),
+        "Kenya": (-0.0236, 37.9062),
+        "Ghana": (7.9465, -1.0232),
+        "Zimbabwe": (-19.0154, 29.1549),
+    }
+    return country_coords.get(country, (None, None))
+
 def geocode_city(city: str, country: str):
     """Get coordinates for a city using Nominatim (OSM). Returns (lat, lon) or None."""
     try:
@@ -113,11 +138,9 @@ class ProfileSetupPayload(BaseModel):
     want_kids: Optional[str] = ""; smoke: Optional[str] = ""
     drink: Optional[str] = ""; employment: Optional[str] = ""
     profile_image: Optional[str] = ""; gallery_images: Optional[List[str]] = []
-    # Preferences
     pref_gender: Optional[str] = ""; pref_min_age: Optional[int] = 18
     pref_max_age: Optional[int] = 99; pref_country: Optional[str] = ""
     pref_max_distance: Optional[int] = 50; pref_health_status: Optional[str] = ""
-    # Visibility
     profile_hidden: Optional[bool] = False
     hide_from_min_age: Optional[int] = None; hide_from_max_age: Optional[int] = None
     hide_from_health_statuses: Optional[str] = ""
@@ -396,8 +419,16 @@ def get_profile(user: dict) -> dict:
 @api_router.post("/profile/setup")
 def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current_user)):
     lat, lon = payload.latitude, payload.longitude
+    
+    # Always try to geocode if coordinates are missing
     if (lat is None or lon is None) and payload.city and payload.country:
         lat, lon = geocode_city(payload.city, payload.country)
+        # Fallback: use country-level coordinates
+        if lat is None or lon is None:
+            lat, lon = geocode_country(payload.country)
+    elif (lat is None or lon is None) and payload.country:
+        lat, lon = geocode_country(payload.country)
+
     existing = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
     profile_data = {
         "user_id": user["user_id"],
@@ -454,6 +485,11 @@ async def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get
         if city and country:
             lat, lon = geocode_city(city, country)
             if lat and lon:
+                updates["latitude"] = lat
+                updates["longitude"] = lon
+        elif country:
+            lat, lon = geocode_country(country)
+            if lat is not None and lon is not None:
                 updates["latitude"] = lat
                 updates["longitude"] = lon
     updates["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -519,11 +555,25 @@ def get_discover_profiles(user: dict = Depends(get_current_user)):
         if age is not None and (age < pref_min_age or age > pref_max_age): continue
         if pref_health_status and p.get("health_status") != pref_health_status: continue
         if pref_country and p.get("country") != pref_country: continue
+        
+        # Always try to calculate distance
         distance = None
-        if my_lat and my_lon and p.get("latitude") and p.get("longitude"):
-            distance = haversine(my_lat, my_lon, p["latitude"], p["longitude"])
-            if pref_max_distance and distance > pref_max_distance: continue
-        p["distance_km"] = distance
+        if my_lat is not None and my_lon is not None:
+            p_lat = p.get("latitude")
+            p_lon = p.get("longitude")
+            if p_lat is not None and p_lon is not None:
+                distance = haversine(my_lat, my_lon, p_lat, p_lon)
+                if pref_max_distance and distance > pref_max_distance:
+                    continue
+            elif p.get("country"):
+                # Fallback: geocode by country
+                flat, flon = geocode_country(p["country"])
+                if flat is not None and flon is not None:
+                    distance = haversine(my_lat, my_lon, flat, flon)
+                    if pref_max_distance and distance > pref_max_distance:
+                        continue
+        
+        p["distance_km"] = round(distance, 1) if distance is not None else None
         p["age"] = age
         filtered.append(p)
     random.shuffle(filtered)
@@ -595,7 +645,6 @@ def get_countries():
         if resp.status_code == 200:
             return [{"code": c["cca2"], "name": c["name"]["common"]} for c in resp.json()]
     except: pass
-    # Fallback
     return [
         {"code":"AF","name":"Afghanistan"},{"code":"AL","name":"Albania"},{"code":"DZ","name":"Algeria"},
         {"code":"AR","name":"Argentina"},{"code":"AU","name":"Australia"},{"code":"AT","name":"Austria"},
