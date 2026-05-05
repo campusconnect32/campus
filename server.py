@@ -1,14 +1,15 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, Cookie, Header
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
-import os, logging, hashlib, uuid, random, math, httpx
+import os, logging, hashlib, uuid, random, math, httpx, io, base64
 from urllib.parse import quote
 from pathlib import Path
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime, timezone, timedelta
+from PIL import Image
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -31,6 +32,14 @@ UPGRADE_COST_SOL = 0.012
 MONTHLY_SERVICE_FEE_SOL = 0.01
 DEFAULT_VOTE_COST_SOL = 0.001
 EARTH_RADIUS_KM = 6371
+STORAGE_BUCKET = "avatars"
+IMAGE_URL_PREFIX = f"{SUPABASE_URL}/storage/v1/object/public/{STORAGE_BUCKET}"
+
+PREMIUM_TIERS = {
+    "silver": {"diamond_cost": 45, "duration_days": 30, "label": "Silver"},
+    "gold": {"diamond_cost": 243, "duration_days": 180, "label": "Gold"},
+    "platinum": {"diamond_cost": 432, "duration_days": 365, "label": "Platinum"},
+}
 
 SYSTEM_IMAGES = [
     "https://images.unsplash.com/photo-1723283126758-28f2a308bc47?crop=entropy&cs=srgb&fm=jpg&w=800&q=80",
@@ -72,7 +81,6 @@ def haversine(lat1, lon1, lat2, lon2):
     return round(EARTH_RADIUS_KM * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a)), 1)
 
 def geocode_country(country: str):
-    """Get approximate coordinates for a country using Nominatim."""
     try:
         resp = httpx.get("https://nominatim.openstreetmap.org/search", params={
             "q": country, "format": "json", "limit": 1
@@ -81,7 +89,6 @@ def geocode_country(country: str):
             data = resp.json()[0]
             return float(data["lat"]), float(data["lon"])
     except: pass
-    # Hardcoded fallback
     country_coords = {
         "South Africa": (-30.5595, 22.9375),
         "United States": (37.0902, -95.7129),
@@ -97,7 +104,6 @@ def geocode_country(country: str):
     return country_coords.get(country, (None, None))
 
 def geocode_city(city: str, country: str):
-    """Get coordinates for a city using Nominatim (OSM). Returns (lat, lon) or None."""
     try:
         query = f"{city}, {country}"
         resp = httpx.get("https://nominatim.openstreetmap.org/search", params={
@@ -108,6 +114,59 @@ def geocode_city(city: str, country: str):
             return float(data["lat"]), float(data["lon"])
     except: pass
     return None, None
+
+# ---------- Image Helpers ----------
+def compress_image(base64_str: str, max_size_kb: int = 300) -> bytes:
+    if "," in base64_str:
+        base64_str = base64_str.split(",", 1)[1]
+    img_data = base64.b64decode(base64_str)
+    img = Image.open(io.BytesIO(img_data))
+    if img.mode in ("RGBA", "P"):
+        img = img.convert("RGB")
+    w, h = img.size
+    if w > 1200 or h > 1200:
+        img.thumbnail((1200, 1200), Image.Resampling.LANCZOS)
+    quality = 85
+    while True:
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality)
+        size_kb = buf.tell() / 1024
+        if size_kb <= max_size_kb or quality <= 20:
+            break
+        quality -= 5
+    return buf.getvalue()
+
+def upload_image_to_supabase(file_bytes: bytes, user_id: str, filename: str) -> str:
+    path = f"{user_id}/{filename}"
+    sb.storage.from_(STORAGE_BUCKET).upload(
+        path=path,
+        file=file_bytes,
+        file_options={"content-type": "image/jpeg"}
+    )
+    return f"{IMAGE_URL_PREFIX}/{path}"
+
+def process_image_field(image_value: str, user_id: str, filename_prefix: str) -> str:
+    if not image_value:
+        return image_value
+    if image_value.startswith("data:image") or (len(image_value) > 1000 and "base64" in image_value):
+        try:
+            compressed = compress_image(image_value)
+            filename = f"{filename_prefix}_{uuid.uuid4().hex[:8]}.jpg"
+            return upload_image_to_supabase(compressed, user_id, filename)
+        except Exception as e:
+            logger.error(f"Image compression/upload failed: {e}")
+            return image_value
+    return image_value
+
+def get_proxied_image_url(supabase_url: str) -> str:
+    if not supabase_url:
+        return supabase_url
+    if "/api/images/" in supabase_url:
+        return supabase_url
+    if IMAGE_URL_PREFIX in supabase_url:
+        rel_path = supabase_url.replace(IMAGE_URL_PREFIX, "").lstrip("/")
+        return f"/api/images/{rel_path}"
+    return supabase_url
 
 # ---------- Models ----------
 class CardCreate(BaseModel):
@@ -172,6 +231,9 @@ class SwipePayload(BaseModel):
 class MatchMessagePayload(BaseModel):
     content: str
 
+class PurchasePremiumPayload(BaseModel):
+    tier: str
+
 # ---------- Auth ----------
 def get_current_user(
     request: Request,
@@ -188,15 +250,11 @@ def get_current_user(
     user = _maybe(sb.table("users").select("*").eq("user_id", session["user_id"]).maybe_single().execute())
     if not user: raise HTTPException(status_code=401, detail="User not found")
     check_service_fee(user)
+    check_premium_status(user)
     return user
 
-@app.get("/")
-def root():
-    return {"message": "Haven API is running"}
-
-@api_router.get("/")
-def api_root():
-    return {"message": "Haven API"}
+@app.get("/") ; def root(): return {"message": "Haven API is running"}
+@api_router.get("/") ; def api_root(): return {"message": "Haven API"}
 
 @api_router.post("/auth/google")
 def auth_google(payload: GoogleAuthPayload, response: Response):
@@ -233,6 +291,7 @@ def auth_google(payload: GoogleAuthPayload, response: Response):
 @api_router.get("/auth/me")
 def auth_me(user: dict = Depends(get_current_user)):
     check_service_fee(user)
+    check_premium_status(user)
     profile = _maybe(sb.table("user_profiles").select("onboarding_complete").eq("user_id", user["user_id"]).maybe_single().execute())
     onboarding_complete = profile.get("onboarding_complete", False) if profile else False
     return {
@@ -248,6 +307,8 @@ def auth_me(user: dict = Depends(get_current_user)):
         "vote_cost_sol": DEFAULT_VOTE_COST_SOL, "service_fee_paid": user.get("service_fee_paid", False),
         "upgrade_date": user.get("upgrade_date"), "last_service_fee_date": user.get("last_service_fee_date"),
         "onboarding_complete": onboarding_complete,
+        "premium_tier": user.get("premium_tier", "free"),
+        "premium_expires_at": user.get("premium_expires_at"),
     }
 
 @api_router.post("/auth/logout")
@@ -267,6 +328,16 @@ def check_service_fee(user: dict):
     else:
         now = datetime.now(timezone.utc)
         sb.table("users").update({"last_service_fee_date": now.isoformat(), "service_fee_paid": True}).eq("user_id", user["user_id"]).execute()
+
+def check_premium_status(user: dict):
+    tier = user.get("premium_tier", "free")
+    expires_at = user.get("premium_expires_at")
+    if tier != "free" and expires_at:
+        expires_dt = _parse_dt(expires_at)
+        if expires_dt and expires_dt < datetime.now(timezone.utc):
+            sb.table("users").update({"premium_tier": "free", "premium_expires_at": None}).eq("user_id", user["user_id"]).execute()
+            user["premium_tier"] = "free"
+            user["premium_expires_at"] = None
 
 # ---------- Wallet & Upgrade ----------
 @api_router.post("/wallet/connect")
@@ -396,6 +467,11 @@ def get_profile(user: dict) -> dict:
             "profile_hidden": False, "hide_from_min_age": None, "hide_from_max_age": None,
             "hide_from_health_statuses": ""
         }
+    profile_image = profile.get("profile_image", "")
+    if profile_image and not profile_image.startswith("data:"):
+        profile_image = get_proxied_image_url(profile_image)
+    gallery = profile.get("gallery_images") or []
+    gallery_proxied = [get_proxied_image_url(url) for url in gallery if url and not url.startswith("data:")]
     return {
         "user_id": profile["user_id"], "email": user.get("email",""), "name": user.get("name",""),
         "date_of_birth": profile.get("date_of_birth"), "gender": profile.get("gender"),
@@ -408,8 +484,8 @@ def get_profile(user: dict) -> dict:
         "education": profile.get("education",""), "kids": profile.get("kids",""),
         "want_kids": profile.get("want_kids",""), "smoke": profile.get("smoke",""),
         "drink": profile.get("drink",""), "employment": profile.get("employment",""),
-        "profile_image": profile.get("profile_image", user.get("picture","")),
-        "gallery_images": profile.get("gallery_images", []),
+        "profile_image": profile_image or user.get("picture",""),
+        "gallery_images": gallery_proxied,
         "onboarding_complete": profile.get("onboarding_complete", False),
         "pref_gender": profile.get("pref_gender",""), "pref_min_age": profile.get("pref_min_age",18),
         "pref_max_age": profile.get("pref_max_age",99), "pref_country": profile.get("pref_country",""),
@@ -419,21 +495,22 @@ def get_profile(user: dict) -> dict:
         "hide_from_min_age": profile.get("hide_from_min_age"),
         "hide_from_max_age": profile.get("hide_from_max_age"),
         "hide_from_health_statuses": profile.get("hide_from_health_statuses",""),
+        "premium_tier": user.get("premium_tier", "free"),
     }
 
 @api_router.post("/profile/setup")
 def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current_user)):
     lat, lon = payload.latitude, payload.longitude
-    
-    # Always try to geocode if coordinates are missing
     if (lat is None or lon is None) and payload.city and payload.country:
         lat, lon = geocode_city(payload.city, payload.country)
-        # Fallback: use country-level coordinates
         if lat is None or lon is None:
             lat, lon = geocode_country(payload.country)
     elif (lat is None or lon is None) and payload.country:
         lat, lon = geocode_country(payload.country)
-
+    profile_image = process_image_field(payload.profile_image, user["user_id"], "profile")
+    gallery = []
+    for i, img in enumerate(payload.gallery_images or []):
+        gallery.append(process_image_field(img, user["user_id"], f"gallery_{i}"))
     existing = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
     profile_data = {
         "user_id": user["user_id"],
@@ -447,8 +524,8 @@ def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current
         "education": payload.education or "", "kids": payload.kids or "",
         "want_kids": payload.want_kids or "", "smoke": payload.smoke or "",
         "drink": payload.drink or "", "employment": payload.employment or "",
-        "profile_image": payload.profile_image or user.get("picture",""),
-        "gallery_images": payload.gallery_images or [],
+        "profile_image": profile_image,
+        "gallery_images": gallery,
         "pref_gender": payload.pref_gender or "", "pref_min_age": payload.pref_min_age,
         "pref_max_age": payload.pref_max_age, "pref_country": payload.pref_country or "",
         "pref_max_distance": payload.pref_max_distance,
@@ -474,7 +551,6 @@ async def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get
         "date_of_birth", "gender", "country", "city", "health_status",
         "latitude", "longitude", "display_name", "bio", "interests", "looking_for",
         "education", "kids", "want_kids", "smoke", "drink", "employment",
-        "profile_image", "gallery_images",
         "pref_gender", "pref_min_age", "pref_max_age", "pref_country",
         "pref_max_distance", "pref_health_status",
         "profile_hidden", "hide_from_min_age", "hide_from_max_age", "hide_from_health_statuses"
@@ -482,14 +558,20 @@ async def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get
     for field in all_fields:
         value = getattr(payload, field, None)
         if value is not None: updates[field] = value
+    if payload.profile_image is not None:
+        updates["profile_image"] = process_image_field(payload.profile_image, user["user_id"], "profile")
+    if payload.gallery_images is not None:
+        new_gallery = []
+        for i, img in enumerate(payload.gallery_images):
+            new_gallery.append(process_image_field(img, user["user_id"], f"gallery_{i}"))
+        updates["gallery_images"] = new_gallery
     if not updates: return {"ok": True, "profile": get_profile(user)}
-    # Geocode if city/country changed and lat/lon not provided
     if ("city" in updates or "country" in updates) and "latitude" not in updates:
         city = updates.get("city", (await get_profile(user))["city"])
         country = updates.get("country", (await get_profile(user))["country"])
         if city and country:
             lat, lon = geocode_city(city, country)
-            if lat and lon:
+            if lat is not None and lon is not None:
                 updates["latitude"] = lat
                 updates["longitude"] = lon
         elif country:
@@ -510,6 +592,24 @@ async def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get
 @api_router.get("/profile")
 def get_my_profile(user: dict = Depends(get_current_user)):
     return get_profile(user)
+
+# ---------- Image Proxy ----------
+@api_router.get("/images/{user_id}/{filename:path}")
+async def serve_image(user_id: str, filename: str):
+    path = f"{user_id}/{filename}"
+    try:
+        file_data = sb.storage.from_(STORAGE_BUCKET).download(path)
+        return Response(
+            content=file_data,
+            media_type="image/jpeg",
+            headers={
+                "Cache-Control": "public, max-age=31536000, immutable",
+                "CDN-Cache-Control": "public, max-age=31536000",
+            }
+        )
+    except Exception as e:
+        logger.error(f"Image proxy error: {e}")
+        raise HTTPException(status_code=404, detail="Image not found")
 
 # ---------- Discovery ----------
 @api_router.get("/discover/profiles")
@@ -560,26 +660,23 @@ def get_discover_profiles(user: dict = Depends(get_current_user)):
         if age is not None and (age < pref_min_age or age > pref_max_age): continue
         if pref_health_status and p.get("health_status") != pref_health_status: continue
         if pref_country and p.get("country") != pref_country: continue
-        
-        # Always try to calculate distance
         distance = None
         if my_lat is not None and my_lon is not None:
             p_lat = p.get("latitude")
             p_lon = p.get("longitude")
             if p_lat is not None and p_lon is not None:
                 distance = haversine(my_lat, my_lon, p_lat, p_lon)
-                if pref_max_distance and distance > pref_max_distance:
-                    continue
+                if pref_max_distance and distance > pref_max_distance: continue
             elif p.get("country"):
-                # Fallback: geocode by country
                 flat, flon = geocode_country(p["country"])
                 if flat is not None and flon is not None:
                     distance = haversine(my_lat, my_lon, flat, flon)
-                    if pref_max_distance and distance > pref_max_distance:
-                        continue
-        
+                    if pref_max_distance and distance > pref_max_distance: continue
         p["distance_km"] = round(distance, 1) if distance is not None else None
         p["age"] = age
+        p["profile_image"] = get_proxied_image_url(p.get("profile_image",""))
+        gallery = p.get("gallery_images") or []
+        p["gallery_images"] = [get_proxied_image_url(url) for url in gallery if url]
         filtered.append(p)
     random.shuffle(filtered)
     return filtered[:50]
@@ -594,7 +691,8 @@ def get_matches(swipe_type: Optional[str] = 'dating', user: dict = Depends(get_c
         if profile:
             result.append({
                 "match_id": m["match_id"], "user_id": partner_id,
-                "display_name": profile.get("display_name",""), "profile_image": profile.get("profile_image",""),
+                "display_name": profile.get("display_name",""),
+                "profile_image": get_proxied_image_url(profile.get("profile_image","")),
                 "bio": profile.get("bio",""), "country": profile.get("country",""), "city": profile.get("city",""),
                 "health_status": profile.get("health_status"),
                 "created_at": m["created_at"]
@@ -689,7 +787,7 @@ def create_story(payload: CreateStoryPayload, user: dict = Depends(get_current_u
     profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
     story = {"story_id": f"story_{uuid.uuid4().hex[:12]}", "user_id": user["user_id"],
              "author_name": profile.get("display_name", user.get("name","")),
-             "author_avatar": profile.get("profile_image", user.get("picture","")),
+             "author_avatar": get_proxied_image_url(profile.get("profile_image", user.get("picture",""))),
              "content": payload.content, "category": payload.category, "title": payload.title or "",
              "likes": 0, "comment_count": 0, "created_at": datetime.now(timezone.utc).isoformat()}
     sb.table("stories").insert(story).execute()
@@ -739,7 +837,7 @@ def create_comment(story_id: str, payload: CreateCommentPayload, user: dict = De
     profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
     comment = {"comment_id": f"cmt_{uuid.uuid4().hex[:12]}", "story_id": story_id, "user_id": user["user_id"],
                "author_name": profile.get("display_name", user.get("name","")),
-               "author_avatar": profile.get("profile_image", user.get("picture","")),
+               "author_avatar": get_proxied_image_url(profile.get("profile_image", user.get("picture",""))),
                "content": payload.content, "parent_id": payload.parent_id, "likes": 0, "reply_count": 0,
                "created_at": datetime.now(timezone.utc).isoformat()}
     sb.table("story_comments").insert(comment).execute()
@@ -757,6 +855,57 @@ def build_comment_tree(comments):
         if c.get("parent_id") and c["parent_id"] in cmap: cmap[c["parent_id"]]["replies"].append(node)
         else: roots.append(node)
     return roots
+
+# ---------- Premium ----------
+@api_router.post("/premium/purchase")
+def purchase_premium(payload: PurchasePremiumPayload, user: dict = Depends(get_current_user)):
+    if payload.tier not in PREMIUM_TIERS:
+        raise HTTPException(status_code=400, detail="Invalid tier. Choose silver, gold, or platinum.")
+    tier_info = PREMIUM_TIERS[payload.tier]
+    user_diamonds = user.get("diamonds", 0)
+    if user_diamonds < tier_info["diamond_cost"]:
+        raise HTTPException(status_code=402, detail=f"Not enough diamonds. Need {tier_info['diamond_cost']}, have {user_diamonds}.")
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(days=tier_info["duration_days"])
+    new_diamonds = user_diamonds - tier_info["diamond_cost"]
+    sb.table("users").update({
+        "diamonds": new_diamonds,
+        "premium_tier": payload.tier,
+        "premium_expires_at": expires_at.isoformat(),
+    }).eq("user_id", user["user_id"]).execute()
+    sb.table("premium_purchases").insert({
+        "purchase_id": f"prem_{uuid.uuid4().hex[:12]}",
+        "user_id": user["user_id"],
+        "tier": payload.tier,
+        "diamond_cost": tier_info["diamond_cost"],
+        "duration_days": tier_info["duration_days"],
+        "purchased_at": now.isoformat(),
+        "expires_at": expires_at.isoformat(),
+    }).execute()
+    return {
+        "ok": True, "tier": payload.tier,
+        "diamonds_spent": tier_info["diamond_cost"],
+        "diamonds_remaining": new_diamonds,
+        "expires_at": expires_at.isoformat(),
+        "duration_days": tier_info["duration_days"],
+    }
+
+@api_router.get("/premium/status")
+def get_premium_status(user: dict = Depends(get_current_user)):
+    tier = user.get("premium_tier", "free")
+    expires_at = user.get("premium_expires_at")
+    is_active = False
+    if tier != "free" and expires_at:
+        expires_dt = _parse_dt(expires_at)
+        if expires_dt and expires_dt > datetime.now(timezone.utc):
+            is_active = True
+    return {
+        "tier": tier,
+        "is_active": is_active,
+        "expires_at": expires_at,
+        "tiers": PREMIUM_TIERS,
+        "diamonds": user.get("diamonds", 0),
+    }
 
 # ---------- PayFast ----------
 def _payfast_signature(params, passphrase=""):
