@@ -734,7 +734,7 @@ def get_my_profile(user: dict = Depends(get_current_user)):
 
 # ---------- Image Proxy ----------
 @api_router.get("/images/{user_id}/{filename:path}")
-async def serve_image(user_id: str, filename: str):
+async def serve_image(user_id: str, filename: str, user: dict = Depends(get_current_user)):
     path = f"{user_id}/{filename}"
     try:
         file_data = sb.storage.from_(STORAGE_BUCKET).download(path)
