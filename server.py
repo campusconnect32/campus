@@ -710,6 +710,47 @@ def send_match_message(match_id: str, payload: MatchMessagePayload, user: dict =
     }).execute()
     return {"ok": True, "message": msg}
 
+
+
+
+@api_router.delete("/discover/matches/{match_id}")
+def unmatch(match_id: str, user: dict = Depends(get_current_user)):
+    match = _maybe(sb.table("profile_matches").select("*").eq("match_id", match_id).maybe_single().execute())
+    if not match:
+        raise HTTPException(404, "Match not found")
+    if user["user_id"] not in [match["user1_id"], match["user2_id"]]:
+        raise HTTPException(403, "Not your match")
+
+    # Delete all messages for this match
+    sb.table("match_messages").delete().eq("match_id", match_id).execute()
+
+    # Delete the match itself
+    sb.table("profile_matches").delete().eq("match_id", match_id).execute()
+
+    # Optionally, delete any pending requests between these two users
+    uid1, uid2 = match["user1_id"], match["user2_id"]
+    sb.table("dating_requests").delete() \
+        .or_(f"from_user_id.eq.{uid1},to_user_id.eq.{uid1}") \
+        .or_(f"from_user_id.eq.{uid2},to_user_id.eq.{uid2}") \
+        .execute()
+    sb.table("friend_requests").delete() \
+        .or_(f"from_user_id.eq.{uid1},to_user_id.eq.{uid1}") \
+        .or_(f"from_user_id.eq.{uid2},to_user_id.eq.{uid2}") \
+        .execute()
+
+    # Remove swipes between them (so they can match again later if they want)
+    sb.table("profile_swipes").delete() \
+        .or_(f"swiper_id.eq.{uid1},swiped_id.eq.{uid1}") \
+        .or_(f"swiper_id.eq.{uid2},swiped_id.eq.{uid2}") \
+        .execute()
+
+    return {"ok": True}
+
+
+
+
+
+
 @api_router.get("/requests")
 def get_requests(user: dict = Depends(get_current_user)):
     dating = sb.table("dating_requests").select("*").eq("to_user_id", user["user_id"]).eq("status", "pending").execute().data or []
@@ -772,7 +813,7 @@ def get_unread_counts(user: dict = Depends(get_current_user)):
     return {"dating_unread": dating_count, "friend_unread": friend_count}
 
 
-    
+
 
 @api_router.post("/requests/{request_id}/respond")
 def respond_request(request_id: str, action: str, user: dict = Depends(get_current_user)):
