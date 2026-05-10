@@ -9,13 +9,21 @@ from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime, timezone, timedelta
 from PIL import Image
+import httpx as httpx_lib
+
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-SUPABASE_URL = os.environ['SUPABASE_URL']
-SUPABASE_KEY = os.environ['SUPABASE_SERVICE_ROLE_KEY']
+# Create a custom HTTP client that disables HTTP/2
+http_client = httpx_lib.Client(http2=False)
+
+# Create Supabase client normally
 sb: Client = create_client(SUPABASE_URL.rstrip('/'), SUPABASE_KEY)
+
+# Override the internal httpx client used by postgrest
+sb.postgrest.session = http_client
+
 
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
