@@ -166,6 +166,28 @@ def process_image_field(image_value: str, user_id: str, filename_prefix: str) ->
             return image_value
     return image_value
 
+# ---------- Realtime notification helper ----------
+def notify_user(user_id: str, ntype: str, message: str, from_user_id: str = "system"):
+    """Insert a notification and broadcast it via Supabase Realtime to the user's channel."""
+    nid = f"notif_{uuid.uuid4().hex[:12]}"
+    sb.table("notifications").insert({
+        "notification_id": nid,
+        "user_id": user_id,
+        "from_user_id": from_user_id,
+        "type": ntype,
+        "message": message,
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }).execute()
+    try:
+        channel = sb.channel(f"user-{user_id}")
+        channel.send({
+            "type": "broadcast",
+            "event": "new_notification",
+            "payload": {"type": ntype, "message": message}
+        })
+    except Exception as e:
+        logger.error(f"Realtime broadcast failed: {e}")
+
 # ---------- Models ----------
 class LocationUpdatePayload(BaseModel):
     latitude: float
@@ -621,24 +643,12 @@ def swipe_profile(payload: SwipePayload, user: dict = Depends(get_current_user))
             existing_req = _maybe(sb.table("dating_requests").select("*").eq("from_user_id", user["user_id"]).eq("to_user_id", payload.swiped_id).maybe_single().execute())
             if not existing_req:
                 sb.table("dating_requests").insert({"request_id": f"dr_{uuid.uuid4().hex[:12]}", "from_user_id": user["user_id"], "to_user_id": payload.swiped_id, "created_at": datetime.now(timezone.utc).isoformat()}).execute()
-                sb.table("notifications").insert({
-                    "notification_id": f"notif_{uuid.uuid4().hex[:12]}",
-                    "user_id": payload.swiped_id, "from_user_id": user["user_id"],
-                    "type": "dating_request",
-                    "message": f"{from_profile.get('display_name', 'Someone')} sent you a dating request",
-                    "created_at": datetime.now(timezone.utc).isoformat()
-                }).execute()
+                notify_user(payload.swiped_id, "dating_request", f"{from_profile.get('display_name', 'Someone')} sent you a dating request", user["user_id"])
         elif payload.swipe_type == "friendship":
             existing_req = _maybe(sb.table("friend_requests").select("*").eq("from_user_id", user["user_id"]).eq("to_user_id", payload.swiped_id).maybe_single().execute())
             if not existing_req:
                 sb.table("friend_requests").insert({"request_id": f"fr_{uuid.uuid4().hex[:12]}", "from_user_id": user["user_id"], "to_user_id": payload.swiped_id, "created_at": datetime.now(timezone.utc).isoformat()}).execute()
-                sb.table("notifications").insert({
-                    "notification_id": f"notif_{uuid.uuid4().hex[:12]}",
-                    "user_id": payload.swiped_id, "from_user_id": user["user_id"],
-                    "type": "friend_request",
-                    "message": f"{from_profile.get('display_name', 'Someone')} sent you a friend request",
-                    "created_at": datetime.now(timezone.utc).isoformat()
-                }).execute()
+                notify_user(payload.swiped_id, "friend_request", f"{from_profile.get('display_name', 'Someone')} sent you a friend request", user["user_id"])
         other = _maybe(sb.table("profile_swipes").select("*").eq("swiper_id", payload.swiped_id).eq("swiped_id", user["user_id"]).eq("direction","like").eq("swipe_type", payload.swipe_type).maybe_single().execute())
         if other:
             uid1, uid2 = sorted([user["user_id"], payload.swiped_id])
@@ -647,16 +657,8 @@ def swipe_profile(payload: SwipePayload, user: dict = Depends(get_current_user))
                 match_id = f"match_{uuid.uuid4().hex[:12]}"
                 sb.table("profile_matches").insert({"match_id": match_id, "user1_id": uid1, "user2_id": uid2, "swipe_type": payload.swipe_type, "created_at": datetime.now(timezone.utc).isoformat()}).execute()
                 matched = True
-                sb.table("notifications").insert({
-                    "notification_id": f"notif_{uuid.uuid4().hex[:12]}", "user_id": payload.swiped_id, "from_user_id": user["user_id"],
-                    "type": "match_new", "message": f"You matched with {from_profile.get('display_name', 'Someone')}!",
-                    "created_at": datetime.now(timezone.utc).isoformat()
-                }).execute()
-                sb.table("notifications").insert({
-                    "notification_id": f"notif_{uuid.uuid4().hex[:12]}", "user_id": user["user_id"], "from_user_id": payload.swiped_id,
-                    "type": "match_new", "message": f"You matched with {from_profile.get('display_name', 'Someone')}!",
-                    "created_at": datetime.now(timezone.utc).isoformat()
-                }).execute()
+                notify_user(payload.swiped_id, "match_new", f"You matched with {from_profile.get('display_name', 'Someone')}!", user["user_id"])
+                notify_user(user["user_id"], "match_new", f"You matched with {from_profile.get('display_name', 'Someone')}!", payload.swiped_id)
             else: match_id = exist_match["match_id"]
     return {"ok": True, "matched": matched, "match_id": match_id, "direction": payload.direction}
 
@@ -703,13 +705,7 @@ def send_match_message(match_id: str, payload: MatchMessagePayload, user: dict =
     sb.table("match_messages").insert(msg).execute()
     other_id = match["user2_id"] if match["user1_id"] == user["user_id"] else match["user1_id"]
     from_profile = get_profile(user)
-    sb.table("notifications").insert({
-        "notification_id": f"notif_{uuid.uuid4().hex[:12]}",
-        "user_id": other_id, "from_user_id": user["user_id"],
-        "type": "match_message",
-        "message": f"New message from {from_profile.get('display_name', 'Someone')}",
-        "created_at": datetime.now(timezone.utc).isoformat()
-    }).execute()
+    notify_user(other_id, "match_message", f"New message from {from_profile.get('display_name', 'Someone')}", user["user_id"])
     return {"ok": True, "message": msg}
 
 @api_router.delete("/discover/matches/{match_id}")
@@ -802,11 +798,7 @@ def respond_request(request_id: str, action: str, user: dict = Depends(get_curre
             sb.table("profile_matches").insert({"match_id": match_id, "user1_id": uid1, "user2_id": uid2, "swipe_type": swipe_type, "created_at": datetime.now(timezone.utc).isoformat()}).execute()
     from_profile = get_profile(user)
     notif_type = "dating_accepted" if table == "dating_requests" else "friend_accepted"
-    sb.table("notifications").insert({
-        "notification_id": f"notif_{uuid.uuid4().hex[:12]}", "user_id": req["from_user_id"], "from_user_id": user["user_id"],
-        "type": notif_type, "message": f"{from_profile.get('display_name','Someone')} {action}ed your request",
-        "created_at": datetime.now(timezone.utc).isoformat()
-    }).execute()
+    notify_user(req["from_user_id"], notif_type, f"{from_profile.get('display_name','Someone')} {action}ed your request", user["user_id"])
     return {"ok": True, "status": new_status}
 
 @api_router.get("/notifications")
