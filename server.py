@@ -725,6 +725,25 @@ def unmatch(match_id: str, user: dict = Depends(get_current_user)):
         .execute()
     return {"ok": True}
 
+
+@api_router.get("/discover/matches/{match_id}/profile")
+def get_match_profile(match_id: str, user: dict = Depends(get_current_user)):
+    # find the match
+    match = _maybe(sb.table("profile_matches").select("*").eq("match_id", match_id).maybe_single().execute())
+    if not match:
+        raise HTTPException(404, "Match not found")
+    if user["user_id"] not in [match["user1_id"], match["user2_id"]]:
+        raise HTTPException(403, "Not your match")
+
+    # identify the partner
+    partner_id = match["user2_id"] if match["user1_id"] == user["user_id"] else match["user1_id"]
+
+    # fetch partner's full profile
+    partner_profile = get_profile({"user_id": partner_id})   # reuse the existing get_profile
+    return partner_profile
+
+    
+
 @api_router.get("/unread-counts")
 def get_unread_counts(user: dict = Depends(get_current_user)):
     unread_res = sb.table("match_messages") \
