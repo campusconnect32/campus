@@ -742,7 +742,7 @@ def get_match_profile(match_id: str, user: dict = Depends(get_current_user)):
     partner_profile = get_profile({"user_id": partner_id})   # reuse the existing get_profile
     return partner_profile
 
-    
+
 
 @api_router.get("/unread-counts")
 def get_unread_counts(user: dict = Depends(get_current_user)):
@@ -924,6 +924,74 @@ def build_comment_tree(comments):
         if c.get("parent_id") and c["parent_id"] in cmap: cmap[c["parent_id"]]["replies"].append(node)
         else: roots.append(node)
     return roots
+
+
+
+# ---------- Edit / delete stories ----------
+@api_router.put("/stories/{story_id}")
+def edit_story(story_id: str, payload: CreateStoryPayload, user: dict = Depends(get_current_user)):
+    story = _maybe(sb.table("stories").select("*").eq("story_id", story_id).maybe_single().execute())
+    if not story: raise HTTPException(404, "Story not found")
+    if story["user_id"] != user["user_id"]: raise HTTPException(403, "Not your story")
+
+    updates = {}
+    if payload.title is not None: updates["title"] = payload.title
+    if payload.content is not None: updates["content"] = payload.content
+    if payload.category is not None: updates["category"] = payload.category
+    if updates:
+        updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+        sb.table("stories").update(updates).eq("story_id", story_id).execute()
+        return {"ok": True}
+    return {"ok": True}
+
+@api_router.delete("/stories/{story_id}")
+def delete_story(story_id: str, user: dict = Depends(get_current_user)):
+    story = _maybe(sb.table("stories").select("*").eq("story_id", story_id).maybe_single().execute())
+    if not story: raise HTTPException(404, "Story not found")
+    if story["user_id"] != user["user_id"]: raise HTTPException(403, "Not your story")
+
+    # Delete all comments first (cascade manually)
+    sb.table("story_comments").delete().eq("story_id", story_id).execute()
+    sb.table("story_likes").delete().eq("story_id", story_id).execute()
+    sb.table("stories").delete().eq("story_id", story_id).execute()
+    return {"ok": True}
+
+# ---------- Edit / delete comments ----------
+@api_router.put("/stories/{story_id}/comments/{comment_id}")
+def edit_comment(story_id: str, comment_id: str, payload: CreateCommentPayload, user: dict = Depends(get_current_user)):
+    comment = _maybe(sb.table("story_comments").select("*").eq("comment_id", comment_id).eq("story_id", story_id).maybe_single().execute())
+    if not comment: raise HTTPException(404, "Comment not found")
+    if comment["user_id"] != user["user_id"]: raise HTTPException(403, "Not your comment")
+
+    sb.table("story_comments").update({"content": payload.content}).eq("comment_id", comment_id).execute()
+    return {"ok": True}
+
+@api_router.delete("/stories/{story_id}/comments/{comment_id}")
+def delete_comment(story_id: str, comment_id: str, user: dict = Depends(get_current_user)):
+    comment = _maybe(sb.table("story_comments").select("*").eq("comment_id", comment_id).eq("story_id", story_id).maybe_single().execute())
+    if not comment: raise HTTPException(404, "Comment not found")
+    if comment["user_id"] != user["user_id"]: raise HTTPException(403, "Not your comment")
+
+    # Delete all replies recursively
+    def delete_replies(parent_id):
+        replies = sb.table("story_comments").select("comment_id").eq("parent_id", parent_id).execute().data or []
+        for reply in replies:
+            delete_replies(reply["comment_id"])
+            sb.table("story_comments").delete().eq("comment_id", reply["comment_id"]).execute()
+
+    delete_replies(comment_id)
+    # Delete the comment itself
+    sb.table("story_comments").delete().eq("comment_id", comment_id).execute()
+
+    # Update story comment count (optional but neat)
+    remaining = sb.table("story_comments").select("comment_id", count="exact").eq("story_id", story_id).execute()
+    new_count = remaining.count if hasattr(remaining, 'count') else 0
+    sb.table("stories").update({"comment_count": new_count}).eq("story_id", story_id).execute()
+
+    return {"ok": True}
+
+
+
 
 # ---------- Countries/Cities ----------
 @api_router.get("/location/countries")
