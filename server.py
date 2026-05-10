@@ -2,7 +2,7 @@ from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depend
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
-from supabase import create_client, Client
+from supabase import create_async_client, Client
 import os, logging, uuid, random, math, httpx, io, base64
 from pathlib import Path
 from pydantic import BaseModel
@@ -17,12 +17,17 @@ load_dotenv(ROOT_DIR / '.env')
 SUPABASE_URL = os.environ['SUPABASE_URL']
 SUPABASE_KEY = os.environ['SUPABASE_SERVICE_ROLE_KEY']
 
-# Create Supabase client normally
-sb: Client = create_client(SUPABASE_URL.rstrip('/'), SUPABASE_KEY)
+# Create async Supabase client with HTTP/1.1 forced
+async def get_supabase():
+    async_http = httpx_lib.AsyncClient(http2=False)
+    return create_async_client(SUPABASE_URL.rstrip('/'), SUPABASE_KEY)
 
-# Override the internal httpx client to use HTTP/1.1 (prevents ReadError)
-http_client = httpx_lib.Client(http2=False)
-sb.postgrest.session = http_client
+# We need a global async client, but create_async_client is not async itself.
+# We'll create it at module level using a workaround: create a sync client and modify session.
+# Actually create_async_client returns a Client synchronously.
+sb = create_async_client(SUPABASE_URL.rstrip('/'), SUPABASE_KEY)
+# Override the internal httpx session to use HTTP/1.1
+sb.postgrest.session = httpx_lib.AsyncClient(http2=False)
 
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
@@ -51,7 +56,6 @@ EARTH_RADIUS_KM = 6371
 MAX_GPS_AGE_HOURS = 24
 STORAGE_BUCKET = "avatars"
 
-# Profanity filter
 PROFANITY_LIST = {"fuck", "shit", "bitch", "asshole", "bastard", "dick", "pussy", "cunt", "whore"}
 
 def contains_profanity(text: str) -> bool:
@@ -102,7 +106,7 @@ def reverse_geocode(lat: float, lon: float) -> tuple:
         logger.error(f"Reverse geocoding failed: {e}")
     return None, None
 
-async def get_location_from_ip(ip: str) -> tuple:
+async def get_location_from_ip(ip: str) -> dict:
     try:
         async with httpx.AsyncClient(timeout=5) as client:
             resp = await client.get(f"http://ip-api.com/json/{ip}?fields=status,lat,lon,country,city")
@@ -121,7 +125,7 @@ async def get_location_from_ip(ip: str) -> tuple:
     return None
 
 # ---------- Image Helpers (WebP) ----------
-def compress_image(base64_str: str, max_size_kb: int = 300) -> bytes:
+async def compress_image(base64_str: str, max_size_kb: int = 300) -> bytes:
     if "," in base64_str:
         base64_str = base64_str.split(",", 1)[1]
     img_data = base64.b64decode(base64_str)
@@ -141,9 +145,9 @@ def compress_image(base64_str: str, max_size_kb: int = 300) -> bytes:
         quality -= 5
     return buf.getvalue()
 
-def upload_image_to_supabase(file_bytes: bytes, user_id: str, filename: str) -> str:
+async def upload_image_to_supabase(file_bytes: bytes, user_id: str, filename: str) -> str:
     path = f"{user_id}/{filename}"
-    sb.storage.from_(STORAGE_BUCKET).upload(
+    await sb.storage.from_(STORAGE_BUCKET).upload(
         path=path,
         file=file_bytes,
         file_options={
@@ -153,14 +157,14 @@ def upload_image_to_supabase(file_bytes: bytes, user_id: str, filename: str) -> 
     )
     return f"{SUPABASE_URL}/storage/v1/object/public/{STORAGE_BUCKET}/{path}"
 
-def process_image_field(image_value: str, user_id: str, filename_prefix: str) -> str:
+async def process_image_field(image_value: str, user_id: str, filename_prefix: str) -> str:
     if not image_value:
         return image_value
     if image_value.startswith("data:image") or (len(image_value) > 1000 and "base64" in image_value):
         try:
-            compressed = compress_image(image_value)
+            compressed = await compress_image(image_value)
             filename = f"{filename_prefix}_{uuid.uuid4().hex[:8]}.jpg"
-            return upload_image_to_supabase(compressed, user_id, filename)
+            return await upload_image_to_supabase(compressed, user_id, filename)
         except Exception as e:
             logger.error(f"Image compression/upload failed: {e}")
             return image_value
@@ -168,9 +172,7 @@ def process_image_field(image_value: str, user_id: str, filename_prefix: str) ->
 
 # ---------- Models ----------
 class LocationUpdatePayload(BaseModel):
-    latitude: float
-    longitude: float
-    accuracy: Optional[float] = None
+    latitude: float; longitude: float; accuracy: Optional[float] = None
 
 class GoogleAuthPayload(BaseModel):
     id_token: str; email: str; name: str; picture: str; ref: Optional[str] = None
@@ -215,13 +217,12 @@ class SwipePayload(BaseModel):
 class MatchMessagePayload(BaseModel):
     content: str
 class ReportPayload(BaseModel):
-    reported_user_id: str
-    reason: Optional[str] = ""
+    reported_user_id: str; reason: Optional[str] = ""
 class BlockPayload(BaseModel):
     blocked_user_id: str
 
 # ---------- Auth ----------
-def get_current_user(
+async def get_current_user(
     request: Request,
     session_token_cookie: Optional[str] = Cookie(default=None, alias="session_token"),
     authorization: Optional[str] = Header(default=None),
@@ -229,14 +230,14 @@ def get_current_user(
     token = session_token_cookie
     if not token and authorization and authorization.startswith("Bearer "): token = authorization.split(" ", 1)[1]
     if not token: raise HTTPException(status_code=401, detail="Not authenticated")
-    res = sb.table("user_sessions").select("*").eq("session_token", token).maybe_single().execute()
+    res = await sb.table("user_sessions").select("*").eq("session_token", token).maybe_single().execute()
     session = _maybe(res)
     if not session: raise HTTPException(status_code=401, detail="Invalid session")
     if _parse_dt(session["expires_at"]) < datetime.now(timezone.utc): raise HTTPException(status_code=401)
-    user = _maybe(sb.table("users").select("*").eq("user_id", session["user_id"]).maybe_single().execute())
+    user = _maybe(await sb.table("users").select("*").eq("user_id", session["user_id"]).maybe_single().execute())
     if not user: raise HTTPException(status_code=401, detail="User not found")
-    # Update last active timestamp
-    sb.table("users").update({"last_active": datetime.now(timezone.utc).isoformat()}).eq("user_id", user["user_id"]).execute()
+    # Update last active
+    await sb.table("users").update({"last_active": datetime.now(timezone.utc).isoformat()}).eq("user_id", user["user_id"]).execute()
     return user
 
 @app.get("/")
@@ -248,80 +249,74 @@ def api_root():
     return {"message": "Haven API"}
 
 @api_router.post("/auth/google")
-def auth_google(payload: GoogleAuthPayload, request: Request, response: Response):
+async def auth_google(payload: GoogleAuthPayload, request: Request, response: Response):
     email, name, picture = payload.email, payload.name, payload.picture
     session_token = f"session_{uuid.uuid4().hex[:32]}"
-    existing = _maybe(sb.table("users").select("*").eq("email", email).maybe_single().execute())
+    existing = _maybe(await sb.table("users").select("*").eq("email", email).maybe_single().execute())
     now_iso = datetime.now(timezone.utc).isoformat()
     if existing:
         user_id = existing["user_id"]
-        sb.table("users").update({"name": name, "picture": picture, "last_active": now_iso}).eq("user_id", user_id).execute()
+        await sb.table("users").update({"name": name, "picture": picture, "last_active": now_iso}).eq("user_id", user_id).execute()
     else:
         user_id = f"user_{uuid.uuid4().hex[:12]}"
-        sb.table("users").insert({
+        await sb.table("users").insert({
             "user_id": user_id, "email": email, "name": name, "picture": picture,
             "created_at": now_iso, "last_active": now_iso,
         }).execute()
     expires_at = datetime.now(timezone.utc) + timedelta(days=7)
-    sb.table("user_sessions").upsert({"session_token": session_token, "user_id": user_id, "expires_at": expires_at.isoformat(), "created_at": now_iso}).execute()
+    await sb.table("user_sessions").upsert({"session_token": session_token, "user_id": user_id, "expires_at": expires_at.isoformat(), "created_at": now_iso}).execute()
     response.set_cookie(
-        key="session_token",
-        value=session_token,
-        httponly=True,
-        secure=request.url.scheme == "https",
-        samesite="lax",
-        path="/",
-        max_age=7*24*60*60
+        key="session_token", value=session_token,
+        httponly=True, secure=request.url.scheme == "https",
+        samesite="lax", path="/", max_age=7*24*60*60
     )
     return {"ok": True, "user_id": user_id, "token": session_token}
 
 @api_router.get("/auth/me")
-def auth_me(user: dict = Depends(get_current_user)):
-    profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
+async def auth_me(user: dict = Depends(get_current_user)):
+    profile = _maybe(await sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
     onboarding_complete = profile.get("onboarding_complete", False) if profile else False
     has_gps = profile and profile.get("gps_latitude") is not None if profile else False
     gps_stale = False
     if has_gps and profile.get("gps_verified_at"):
         gps_age = datetime.now(timezone.utc) - _parse_dt(profile["gps_verified_at"])
         gps_stale = gps_age > timedelta(hours=MAX_GPS_AGE_HOURS)
-    notif_count = sb.table("notifications").select("notification_id", count="exact").eq("user_id", user["user_id"]).eq("read", False).execute()
-    unread = notif_count.count if hasattr(notif_count, 'count') else 0
+    notif_cnt = await sb.table("notifications").select("notification_id", count="exact").eq("user_id", user["user_id"]).eq("read", False).execute()
+    unread = notif_cnt.count if hasattr(notif_cnt, 'count') else 0
     return {
         "user_id": user["user_id"], "email": user["email"], "name": user["name"],
         "picture": user.get("picture", ""),
         "onboarding_complete": onboarding_complete,
         "unread_notifications": unread,
-        "has_gps": has_gps,
-        "gps_stale": gps_stale,
+        "has_gps": has_gps, "gps_stale": gps_stale,
         "needs_location": not has_gps or gps_stale,
     }
 
 @api_router.post("/auth/logout")
-def auth_logout(response: Response, session_token_cookie: Optional[str] = Cookie(default=None, alias="session_token"), authorization: Optional[str] = Header(default=None)):
+async def auth_logout(response: Response, session_token_cookie: Optional[str] = Cookie(default=None, alias="session_token"), authorization: Optional[str] = Header(default=None)):
     token = session_token_cookie
     if not token and authorization and authorization.startswith("Bearer "): token = authorization.split(" ", 1)[1]
-    if token: sb.table("user_sessions").delete().eq("session_token", token).execute()
+    if token: await sb.table("user_sessions").delete().eq("session_token", token).execute()
     response.delete_cookie(key="session_token", path="/", samesite="lax", secure=False)
     return {"ok": True}
 
-# ---------- Account Deletion ----------
 @api_router.delete("/auth/me")
-def delete_account(user: dict = Depends(get_current_user)):
+async def delete_account(user: dict = Depends(get_current_user)):
     uid = user["user_id"]
-    sb.table("notifications").delete().eq("user_id", uid).execute()
-    sb.table("match_messages").delete().eq("sender_id", uid).execute()
-    sb.table("profile_matches").delete().or_(f"user1_id.eq.{uid},user2_id.eq.{uid}").execute()
-    sb.table("dating_requests").delete().or_(f"from_user_id.eq.{uid},to_user_id.eq.{uid}").execute()
-    sb.table("friend_requests").delete().or_(f"from_user_id.eq.{uid},to_user_id.eq.{uid}").execute()
-    sb.table("profile_swipes").delete().or_(f"swiper_id.eq.{uid},swiped_id.eq.{uid}").execute()
-    sb.table("story_comments").delete().eq("user_id", uid).execute()
-    sb.table("story_likes").delete().eq("user_id", uid).execute()
-    sb.table("stories").delete().eq("user_id", uid).execute()
-    sb.table("user_profiles").delete().eq("user_id", uid).execute()
-    sb.table("user_sessions").delete().eq("user_id", uid).execute()
-    sb.table("user_reports").delete().or_(f"reporter_id.eq.{uid},reported_user_id.eq.{uid}").execute()
-    sb.table("user_blocks").delete().or_(f"blocker_id.eq.{uid},blocked_user_id.eq.{uid}").execute()
-    sb.table("users").update({"deleted": True, "email": f"deleted_{uid}"}).eq("user_id", uid).execute()
+    await sb.table("notifications").delete().eq("user_id", uid).execute()
+    await sb.table("match_messages").delete().or_(f"sender_id.eq.{uid}").execute()
+    await sb.table("profile_matches").delete().or_(f"user1_id.eq.{uid},user2_id.eq.{uid}").execute()
+    await sb.table("dating_requests").delete().or_(f"from_user_id.eq.{uid},to_user_id.eq.{uid}").execute()
+    await sb.table("friend_requests").delete().or_(f"from_user_id.eq.{uid},to_user_id.eq.{uid}").execute()
+    await sb.table("profile_swipes").delete().or_(f"swiper_id.eq.{uid},swiped_id.eq.{uid}").execute()
+    await sb.table("story_comments").delete().eq("user_id", uid).execute()
+    await sb.table("story_likes").delete().eq("user_id", uid).execute()
+    await sb.table("stories").delete().eq("user_id", uid).execute()
+    await sb.table("user_profiles").delete().eq("user_id", uid).execute()
+    await sb.table("user_sessions").delete().eq("user_id", uid).execute()
+    await sb.table("user_reports").delete().or_(f"reporter_id.eq.{uid},reported_user_id.eq.{uid}").execute()
+    await sb.table("user_blocks").delete().or_(f"blocker_id.eq.{uid},blocked_user_id.eq.{uid}").execute()
+    await sb.table("users").update({"deleted": True, "email": f"deleted_{uid}"}).eq("user_id", uid).execute()
     return {"ok": True}
 
 # ---------- Location API ----------
@@ -334,29 +329,18 @@ async def update_location(payload: LocationUpdatePayload, user: dict = Depends(g
     now = datetime.now(timezone.utc)
     country, city = reverse_geocode(payload.latitude, payload.longitude)
     profile_data = {
-        "gps_latitude": payload.latitude,
-        "gps_longitude": payload.longitude,
-        "gps_verified_at": now.isoformat(),
-        "gps_accuracy": payload.accuracy,
-        "location_source": "gps",
-        "latitude": payload.latitude,
-        "longitude": payload.longitude,
-        "country": country,
-        "city": city or "",
-        "updated_at": now.isoformat(),
+        "gps_latitude": payload.latitude, "gps_longitude": payload.longitude,
+        "gps_verified_at": now.isoformat(), "gps_accuracy": payload.accuracy,
+        "location_source": "gps", "latitude": payload.latitude, "longitude": payload.longitude,
+        "country": country, "city": city or "", "updated_at": now.isoformat(),
     }
-    existing = _maybe(sb.table("user_profiles").select("user_id").eq("user_id", user["user_id"]).maybe_single().execute())
+    existing = _maybe(await sb.table("user_profiles").select("user_id").eq("user_id", user["user_id"]).maybe_single().execute())
     if existing:
-        sb.table("user_profiles").update(profile_data).eq("user_id", user["user_id"]).execute()
+        await sb.table("user_profiles").update(profile_data).eq("user_id", user["user_id"]).execute()
     else:
-        profile_data["user_id"] = user["user_id"]
-        profile_data["created_at"] = now.isoformat()
-        sb.table("user_profiles").insert(profile_data).execute()
-    return {
-        "ok": True, "message": "GPS location updated",
-        "latitude": payload.latitude, "longitude": payload.longitude,
-        "country": country, "city": city,
-    }
+        profile_data["user_id"] = user["user_id"]; profile_data["created_at"] = now.isoformat()
+        await sb.table("user_profiles").insert(profile_data).execute()
+    return {"ok": True, "message": "GPS location updated", "latitude": payload.latitude, "longitude": payload.longitude, "country": country, "city": city}
 
 @api_router.get("/location/ip-fallback")
 async def ip_fallback(request: Request, user: dict = Depends(get_current_user)):
@@ -371,21 +355,18 @@ async def ip_fallback(request: Request, user: dict = Depends(get_current_user)):
             "country": location.get('country', ''), "city": location.get('city', ''),
             "updated_at": now.isoformat(),
         }
-        existing = _maybe(sb.table("user_profiles").select("user_id").eq("user_id", user["user_id"]).maybe_single().execute())
+        existing = _maybe(await sb.table("user_profiles").select("user_id").eq("user_id", user["user_id"]).maybe_single().execute())
         if existing:
-            sb.table("user_profiles").update(profile_data).eq("user_id", user["user_id"]).execute()
+            await sb.table("user_profiles").update(profile_data).eq("user_id", user["user_id"]).execute()
         else:
             profile_data["user_id"] = user["user_id"]
-            sb.table("user_profiles").insert(profile_data).execute()
-        return {
-            "ok": True, "latitude": location['latitude'], "longitude": location['longitude'],
-            "country": location.get('country'), "city": location.get('city'), "source": "ip"
-        }
+            await sb.table("user_profiles").insert(profile_data).execute()
+        return {"ok": True, "latitude": location['latitude'], "longitude": location['longitude'], "country": location.get('country'), "city": location.get('city'), "source": "ip"}
     return {"ok": False, "message": "Could not determine location from IP"}
 
 @api_router.get("/location/status")
-def get_location_status(user: dict = Depends(get_current_user)):
-    profile = _maybe(sb.table("user_profiles").select("gps_latitude,gps_longitude,gps_verified_at,location_source").eq("user_id", user["user_id"]).maybe_single().execute())
+async def get_location_status(user: dict = Depends(get_current_user)):
+    profile = _maybe(await sb.table("user_profiles").select("gps_latitude,gps_longitude,gps_verified_at,location_source").eq("user_id", user["user_id"]).maybe_single().execute())
     if not profile or profile.get("gps_latitude") is None:
         return {"has_location": False, "needs_location": True, "message": "No GPS location set"}
     gps_age = datetime.now(timezone.utc) - _parse_dt(profile["gps_verified_at"])
@@ -398,12 +379,8 @@ def get_location_status(user: dict = Depends(get_current_user)):
     }
 
 # ---------- Profile ----------
-def get_profile(user: dict) -> dict:
-    profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
-    # ---- NEW: always fetch last_active from the users table ----
-    user_data = _maybe(sb.table("users").select("last_active").eq("user_id", user["user_id"]).maybe_single().execute())
-    last_active = user_data.get("last_active") if user_data else user.get("last_active")
-    # -----------------------------------------------------------
+async def get_profile(user: dict) -> dict:
+    profile = _maybe(await sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
     if not profile:
         return {
             "user_id": user["user_id"], "email": user.get("email",""), "name": user.get("name",""),
@@ -411,8 +388,7 @@ def get_profile(user: dict) -> dict:
             "health_status": None, "latitude": None, "longitude": None,
             "display_name": user.get("name",""), "bio": "", "interests": "", "looking_for": "",
             "education": "", "kids": "", "want_kids": "", "smoke": "", "drink": "", "employment": "",
-            "profile_image": user.get("picture",""),
-            "gallery_images": [],
+            "profile_image": user.get("picture",""), "gallery_images": [],
             "onboarding_complete": False,
             "pref_gender": "", "pref_min_age": 18, "pref_max_age": 99,
             "pref_country": "", "pref_max_distance": 50, "pref_health_status": "",
@@ -420,7 +396,7 @@ def get_profile(user: dict) -> dict:
             "hide_from_health_statuses": "",
             "gps_latitude": None, "gps_longitude": None, "gps_verified_at": None,
             "location_source": "none",
-            "last_active": last_active,   # ← changed to use the new variable
+            "last_active": user.get("last_active"),
         }
     lat = profile.get("gps_latitude")
     lon = profile.get("gps_longitude")
@@ -452,20 +428,20 @@ def get_profile(user: dict) -> dict:
         "gps_latitude": lat, "gps_longitude": lon,
         "gps_verified_at": profile.get("gps_verified_at"),
         "location_source": profile.get("location_source", "none"),
-        "last_active": last_active,   # ← changed to use the new variable
+        "last_active": user.get("last_active"),
     }
 
 @api_router.post("/profile/setup")
-def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current_user)):
-    existing_profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
+async def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current_user)):
+    existing_profile = _maybe(await sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
     lat = existing_profile.get("gps_latitude") if existing_profile else None
     lon = existing_profile.get("gps_longitude") if existing_profile else None
     country = existing_profile.get("country") if existing_profile and lat else None
     city = existing_profile.get("city") if existing_profile and lat else None
-    profile_image = process_image_field(payload.profile_image, user["user_id"], "profile")
+    profile_image = await process_image_field(payload.profile_image, user["user_id"], "profile")
     gallery = []
     for i, img in enumerate(payload.gallery_images or []):
-        gallery.append(process_image_field(img, user["user_id"], f"gallery_{i}"))
+        gallery.append(await process_image_field(img, user["user_id"], f"gallery_{i}"))
     profile_data = {
         "user_id": user["user_id"],
         "date_of_birth": payload.date_of_birth, "gender": payload.gender,
@@ -497,14 +473,14 @@ def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current
             profile_data["gps_longitude"] = existing_profile["gps_longitude"]
             profile_data["gps_verified_at"] = existing_profile["gps_verified_at"]
             profile_data["location_source"] = existing_profile.get("location_source", "none")
-        sb.table("user_profiles").update(profile_data).eq("user_id", user["user_id"]).execute()
+        await sb.table("user_profiles").update(profile_data).eq("user_id", user["user_id"]).execute()
     else:
         profile_data["created_at"] = datetime.now(timezone.utc).isoformat()
-        sb.table("user_profiles").insert(profile_data).execute()
-    return {"ok": True, "profile": get_profile(user)}
+        await sb.table("user_profiles").insert(profile_data).execute()
+    return {"ok": True, "profile": await get_profile(user)}
 
 @api_router.put("/profile")
-def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_current_user)):
+async def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_current_user)):
     updates = {}
     all_fields = [
         "date_of_birth", "gender", "health_status",
@@ -518,31 +494,31 @@ def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_curre
         value = getattr(payload, field, None)
         if value is not None: updates[field] = value
     if payload.profile_image is not None:
-        updates["profile_image"] = process_image_field(payload.profile_image, user["user_id"], "profile")
+        updates["profile_image"] = await process_image_field(payload.profile_image, user["user_id"], "profile")
     if payload.gallery_images is not None:
         new_gallery = []
         for i, img in enumerate(payload.gallery_images):
-            new_gallery.append(process_image_field(img, user["user_id"], f"gallery_{i}"))
+            new_gallery.append(await process_image_field(img, user["user_id"], f"gallery_{i}"))
         updates["gallery_images"] = new_gallery
-    if not updates: return {"ok": True, "profile": get_profile(user)}
+    if not updates: return {"ok": True, "profile": await get_profile(user)}
     updates["updated_at"] = datetime.now(timezone.utc).isoformat()
-    existing = _maybe(sb.table("user_profiles").select("user_id").eq("user_id", user["user_id"]).maybe_single().execute())
+    existing = _maybe(await sb.table("user_profiles").select("user_id").eq("user_id", user["user_id"]).maybe_single().execute())
     if existing:
-        sb.table("user_profiles").update(updates).eq("user_id", user["user_id"]).execute()
+        await sb.table("user_profiles").update(updates).eq("user_id", user["user_id"]).execute()
     else:
         updates["user_id"] = user["user_id"]; updates["onboarding_complete"] = False
         updates["created_at"] = datetime.now(timezone.utc).isoformat()
-        sb.table("user_profiles").insert(updates).execute()
-    return {"ok": True, "profile": get_profile(user)}
+        await sb.table("user_profiles").insert(updates).execute()
+    return {"ok": True, "profile": await get_profile(user)}
 
 @api_router.get("/profile")
-def get_my_profile(user: dict = Depends(get_current_user)):
-    return get_profile(user)
+async def get_my_profile(user: dict = Depends(get_current_user)):
+    return await get_profile(user)
 
 # ---------- Discovery ----------
 @api_router.get("/discover/profiles")
-def get_discover_profiles(user: dict = Depends(get_current_user)):
-    viewer_profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
+async def get_discover_profiles(user: dict = Depends(get_current_user)):
+    viewer_profile = _maybe(await sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
     if not viewer_profile: return []
     my_lat = viewer_profile.get("gps_latitude") or viewer_profile.get("latitude")
     my_lon = viewer_profile.get("gps_longitude") or viewer_profile.get("longitude")
@@ -555,7 +531,7 @@ def get_discover_profiles(user: dict = Depends(get_current_user)):
     pref_max_distance = viewer_profile.get("pref_max_distance",50)
     pref_health_status = viewer_profile.get("pref_health_status","")
     today = datetime.now(timezone.utc).date()
-    matches = sb.table("profile_matches").select("*").or_(f"user1_id.eq.{user['user_id']},user2_id.eq.{user['user_id']}").execute()
+    matches = await sb.table("profile_matches").select("*").or_(f"user1_id.eq.{user['user_id']},user2_id.eq.{user['user_id']}").execute()
     matched_ids = set()
     for m in (matches.data or []):
         partner = m["user2_id"] if m["user1_id"] == user["user_id"] else m["user1_id"]
@@ -564,7 +540,7 @@ def get_discover_profiles(user: dict = Depends(get_current_user)):
     query = query.not_.is_("gps_latitude", None)
     for mid in matched_ids:
         query = query.neq("user_id", mid)
-    profiles = (query.limit(200).execute()).data or []
+    profiles = (await query.limit(200).execute()).data or []
     filtered = []
     for p in profiles:
         if p.get("profile_hidden"): continue
@@ -591,8 +567,7 @@ def get_discover_profiles(user: dict = Depends(get_current_user)):
         if age is not None and (age < pref_min_age or age > pref_max_age): continue
         if pref_health_status and p.get("health_status") != pref_health_status: continue
         if pref_country and p.get("country") != pref_country: continue
-        p_lat = p.get("gps_latitude")
-        p_lon = p.get("gps_longitude")
+        p_lat = p.get("gps_latitude"); p_lon = p.get("gps_longitude")
         distance = None
         if p_lat is not None and p_lon is not None:
             distance = haversine(my_lat, my_lon, p_lat, p_lon)
@@ -605,59 +580,53 @@ def get_discover_profiles(user: dict = Depends(get_current_user)):
     return filtered[:50]
 
 @api_router.post("/discover/swipe")
-def swipe_profile(payload: SwipePayload, user: dict = Depends(get_current_user)):
+async def swipe_profile(payload: SwipePayload, user: dict = Depends(get_current_user)):
     if payload.direction not in ["like","pass"]: raise HTTPException(400)
-    target = _maybe(sb.table("user_profiles").select("user_id").eq("user_id", payload.swiped_id).maybe_single().execute())
+    target = _maybe(await sb.table("user_profiles").select("user_id").eq("user_id", payload.swiped_id).maybe_single().execute())
     if not target: raise HTTPException(404)
-    existing = _maybe(sb.table("profile_swipes").select("*").eq("swiper_id", user["user_id"]).eq("swiped_id", payload.swiped_id).eq("swipe_type", payload.swipe_type).maybe_single().execute())
+    existing = _maybe(await sb.table("profile_swipes").select("*").eq("swiper_id", user["user_id"]).eq("swiped_id", payload.swiped_id).eq("swipe_type", payload.swipe_type).maybe_single().execute())
     if not existing:
         try:
-            sb.table("profile_swipes").insert({
-                "swipe_id": f"swp_{uuid.uuid4().hex[:12]}",
-                "swiper_id": user["user_id"], "swiped_id": payload.swiped_id,
-                "direction": payload.direction, "swipe_type": payload.swipe_type
+            await sb.table("profile_swipes").insert({
+                "swipe_id": f"swp_{uuid.uuid4().hex[:12]}", "swiper_id": user["user_id"],
+                "swiped_id": payload.swiped_id, "direction": payload.direction, "swipe_type": payload.swipe_type
             }).execute()
-        except Exception:
-            pass
+        except Exception: pass
     matched = False; match_id = None
     if payload.direction == "like":
-        from_profile = get_profile(user)
+        from_profile = await get_profile(user)
         if payload.swipe_type == "dating":
-            existing_req = _maybe(sb.table("dating_requests").select("*").eq("from_user_id", user["user_id"]).eq("to_user_id", payload.swiped_id).maybe_single().execute())
+            existing_req = _maybe(await sb.table("dating_requests").select("*").eq("from_user_id", user["user_id"]).eq("to_user_id", payload.swiped_id).maybe_single().execute())
             if not existing_req:
-                sb.table("dating_requests").insert({"request_id": f"dr_{uuid.uuid4().hex[:12]}", "from_user_id": user["user_id"], "to_user_id": payload.swiped_id, "created_at": datetime.now(timezone.utc).isoformat()}).execute()
-                sb.table("notifications").insert({
-                    "notification_id": f"notif_{uuid.uuid4().hex[:12]}",
-                    "user_id": payload.swiped_id, "from_user_id": user["user_id"],
-                    "type": "dating_request",
-                    "message": f"{from_profile.get('display_name', 'Someone')} sent you a dating request",
+                await sb.table("dating_requests").insert({"request_id": f"dr_{uuid.uuid4().hex[:12]}", "from_user_id": user["user_id"], "to_user_id": payload.swiped_id, "created_at": datetime.now(timezone.utc).isoformat()}).execute()
+                await sb.table("notifications").insert({
+                    "notification_id": f"notif_{uuid.uuid4().hex[:12]}", "user_id": payload.swiped_id, "from_user_id": user["user_id"],
+                    "type": "dating_request", "message": f"{from_profile.get('display_name', 'Someone')} sent you a dating request",
                     "created_at": datetime.now(timezone.utc).isoformat()
                 }).execute()
         elif payload.swipe_type == "friendship":
-            existing_req = _maybe(sb.table("friend_requests").select("*").eq("from_user_id", user["user_id"]).eq("to_user_id", payload.swiped_id).maybe_single().execute())
+            existing_req = _maybe(await sb.table("friend_requests").select("*").eq("from_user_id", user["user_id"]).eq("to_user_id", payload.swiped_id).maybe_single().execute())
             if not existing_req:
-                sb.table("friend_requests").insert({"request_id": f"fr_{uuid.uuid4().hex[:12]}", "from_user_id": user["user_id"], "to_user_id": payload.swiped_id, "created_at": datetime.now(timezone.utc).isoformat()}).execute()
-                sb.table("notifications").insert({
-                    "notification_id": f"notif_{uuid.uuid4().hex[:12]}",
-                    "user_id": payload.swiped_id, "from_user_id": user["user_id"],
-                    "type": "friend_request",
-                    "message": f"{from_profile.get('display_name', 'Someone')} sent you a friend request",
+                await sb.table("friend_requests").insert({"request_id": f"fr_{uuid.uuid4().hex[:12]}", "from_user_id": user["user_id"], "to_user_id": payload.swiped_id, "created_at": datetime.now(timezone.utc).isoformat()}).execute()
+                await sb.table("notifications").insert({
+                    "notification_id": f"notif_{uuid.uuid4().hex[:12]}", "user_id": payload.swiped_id, "from_user_id": user["user_id"],
+                    "type": "friend_request", "message": f"{from_profile.get('display_name', 'Someone')} sent you a friend request",
                     "created_at": datetime.now(timezone.utc).isoformat()
                 }).execute()
-        other = _maybe(sb.table("profile_swipes").select("*").eq("swiper_id", payload.swiped_id).eq("swiped_id", user["user_id"]).eq("direction","like").eq("swipe_type", payload.swipe_type).maybe_single().execute())
+        other = _maybe(await sb.table("profile_swipes").select("*").eq("swiper_id", payload.swiped_id).eq("swiped_id", user["user_id"]).eq("direction","like").eq("swipe_type", payload.swipe_type).maybe_single().execute())
         if other:
             uid1, uid2 = sorted([user["user_id"], payload.swiped_id])
-            exist_match = _maybe(sb.table("profile_matches").select("*").eq("user1_id", uid1).eq("user2_id", uid2).eq("swipe_type", payload.swipe_type).maybe_single().execute())
+            exist_match = _maybe(await sb.table("profile_matches").select("*").eq("user1_id", uid1).eq("user2_id", uid2).eq("swipe_type", payload.swipe_type).maybe_single().execute())
             if not exist_match:
                 match_id = f"match_{uuid.uuid4().hex[:12]}"
-                sb.table("profile_matches").insert({"match_id": match_id, "user1_id": uid1, "user2_id": uid2, "swipe_type": payload.swipe_type, "created_at": datetime.now(timezone.utc).isoformat()}).execute()
+                await sb.table("profile_matches").insert({"match_id": match_id, "user1_id": uid1, "user2_id": uid2, "swipe_type": payload.swipe_type, "created_at": datetime.now(timezone.utc).isoformat()}).execute()
                 matched = True
-                sb.table("notifications").insert({
+                await sb.table("notifications").insert({
                     "notification_id": f"notif_{uuid.uuid4().hex[:12]}", "user_id": payload.swiped_id, "from_user_id": user["user_id"],
                     "type": "match_new", "message": f"You matched with {from_profile.get('display_name', 'Someone')}!",
                     "created_at": datetime.now(timezone.utc).isoformat()
                 }).execute()
-                sb.table("notifications").insert({
+                await sb.table("notifications").insert({
                     "notification_id": f"notif_{uuid.uuid4().hex[:12]}", "user_id": user["user_id"], "from_user_id": payload.swiped_id,
                     "type": "match_new", "message": f"You matched with {from_profile.get('display_name', 'Someone')}!",
                     "created_at": datetime.now(timezone.utc).isoformat()
@@ -666,14 +635,14 @@ def swipe_profile(payload: SwipePayload, user: dict = Depends(get_current_user))
     return {"ok": True, "matched": matched, "match_id": match_id, "direction": payload.direction}
 
 @api_router.get("/discover/matches")
-def get_matches(swipe_type: Optional[str] = 'dating', user: dict = Depends(get_current_user)):
-    matches = sb.table("profile_matches").select("*").or_(f"user1_id.eq.{user['user_id']},user2_id.eq.{user['user_id']}").eq("swipe_type", swipe_type).order("created_at", desc=True).execute()
+async def get_matches(swipe_type: Optional[str] = 'dating', user: dict = Depends(get_current_user)):
+    matches = await sb.table("profile_matches").select("*").or_(f"user1_id.eq.{user['user_id']},user2_id.eq.{user['user_id']}").eq("swipe_type", swipe_type).order("created_at", desc=True).execute()
     result = []
     for m in (matches.data or []):
         partner_id = m["user2_id"] if m["user1_id"] == user["user_id"] else m["user1_id"]
-        profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", partner_id).maybe_single().execute())
+        profile = _maybe(await sb.table("user_profiles").select("*").eq("user_id", partner_id).maybe_single().execute())
         if profile:
-            unread_res = sb.table("match_messages").select("message_id", count="exact").eq("match_id", m["match_id"]).eq("read", False).eq("sender_id", partner_id).execute()
+            unread_res = await sb.table("match_messages").select("message_id", count="exact").eq("match_id", m["match_id"]).eq("read", False).eq("sender_id", partner_id).execute()
             unread = unread_res.count if hasattr(unread_res, 'count') else 0
             result.append({
                 "match_id": m["match_id"], "user_id": partner_id,
@@ -687,60 +656,58 @@ def get_matches(swipe_type: Optional[str] = 'dating', user: dict = Depends(get_c
     return result
 
 @api_router.get("/discover/matches/{match_id}/messages")
-def get_match_messages(match_id: str, user: dict = Depends(get_current_user)):
-    match = _maybe(sb.table("profile_matches").select("*").eq("match_id", match_id).maybe_single().execute())
+async def get_match_messages(match_id: str, user: dict = Depends(get_current_user)):
+    match = _maybe(await sb.table("profile_matches").select("*").eq("match_id", match_id).maybe_single().execute())
     if not match: raise HTTPException(404)
     if user["user_id"] not in [match["user1_id"], match["user2_id"]]: raise HTTPException(403)
-    msgs = sb.table("match_messages").select("*").eq("match_id", match_id).order("created_at").execute().data or []
+    msgs = (await sb.table("match_messages").select("*").eq("match_id", match_id).order("created_at").execute()).data or []
     for msg in msgs:
         if msg["sender_id"] != user["user_id"] and not msg.get("read"):
-            sb.table("match_messages").update({"read": True}).eq("message_id", msg["message_id"]).execute()
+            await sb.table("match_messages").update({"read": True}).eq("message_id", msg["message_id"]).execute()
     return msgs
 
 @api_router.post("/discover/matches/{match_id}/messages")
-def send_match_message(match_id: str, payload: MatchMessagePayload, user: dict = Depends(get_current_user)):
+async def send_match_message(match_id: str, payload: MatchMessagePayload, user: dict = Depends(get_current_user)):
     if contains_profanity(payload.content):
         raise HTTPException(400, "Message contains inappropriate language")
-    match = _maybe(sb.table("profile_matches").select("*").eq("match_id", match_id).maybe_single().execute())
+    match = _maybe(await sb.table("profile_matches").select("*").eq("match_id", match_id).maybe_single().execute())
     if not match: raise HTTPException(404)
     if user["user_id"] not in [match["user1_id"], match["user2_id"]]: raise HTTPException(403)
     msg = {"message_id": f"msg_{uuid.uuid4().hex[:12]}", "match_id": match_id, "sender_id": user["user_id"], "content": payload.content, "read": False, "created_at": datetime.now(timezone.utc).isoformat()}
-    sb.table("match_messages").insert(msg).execute()
+    await sb.table("match_messages").insert(msg).execute()
     other_id = match["user2_id"] if match["user1_id"] == user["user_id"] else match["user1_id"]
-    from_profile = get_profile(user)
-    sb.table("notifications").insert({
-        "notification_id": f"notif_{uuid.uuid4().hex[:12]}",
-        "user_id": other_id, "from_user_id": user["user_id"],
-        "type": "match_message",
-        "message": f"New message from {from_profile.get('display_name', 'Someone')}",
+    from_profile = await get_profile(user)
+    await sb.table("notifications").insert({
+        "notification_id": f"notif_{uuid.uuid4().hex[:12]}", "user_id": other_id, "from_user_id": user["user_id"],
+        "type": "match_message", "message": f"New message from {from_profile.get('display_name', 'Someone')}",
         "created_at": datetime.now(timezone.utc).isoformat()
     }).execute()
     return {"ok": True, "message": msg}
 
 @api_router.delete("/discover/matches/{match_id}")
-def unmatch(match_id: str, user: dict = Depends(get_current_user)):
-    match = _maybe(sb.table("profile_matches").select("*").eq("match_id", match_id).maybe_single().execute())
+async def unmatch(match_id: str, user: dict = Depends(get_current_user)):
+    match = _maybe(await sb.table("profile_matches").select("*").eq("match_id", match_id).maybe_single().execute())
     if not match: raise HTTPException(404, "Match not found")
     if user["user_id"] not in [match["user1_id"], match["user2_id"]]: raise HTTPException(403, "Not your match")
-    sb.table("match_messages").delete().eq("match_id", match_id).execute()
-    sb.table("profile_matches").delete().eq("match_id", match_id).execute()
+    await sb.table("match_messages").delete().eq("match_id", match_id).execute()
+    await sb.table("profile_matches").delete().eq("match_id", match_id).execute()
     uid1, uid2 = match["user1_id"], match["user2_id"]
-    sb.table("dating_requests").delete().or_(f"from_user_id.eq.{uid1},to_user_id.eq.{uid1}").or_(f"from_user_id.eq.{uid2},to_user_id.eq.{uid2}").execute()
-    sb.table("friend_requests").delete().or_(f"from_user_id.eq.{uid1},to_user_id.eq.{uid1}").or_(f"from_user_id.eq.{uid2},to_user_id.eq.{uid2}").execute()
-    sb.table("profile_swipes").delete().or_(f"swiper_id.eq.{uid1},swiped_id.eq.{uid1}").or_(f"swiper_id.eq.{uid2},swiped_id.eq.{uid2}").execute()
+    await sb.table("dating_requests").delete().or_(f"from_user_id.eq.{uid1},to_user_id.eq.{uid1}").or_(f"from_user_id.eq.{uid2},to_user_id.eq.{uid2}").execute()
+    await sb.table("friend_requests").delete().or_(f"from_user_id.eq.{uid1},to_user_id.eq.{uid1}").or_(f"from_user_id.eq.{uid2},to_user_id.eq.{uid2}").execute()
+    await sb.table("profile_swipes").delete().or_(f"swiper_id.eq.{uid1},swiped_id.eq.{uid1}").or_(f"swiper_id.eq.{uid2},swiped_id.eq.{uid2}").execute()
     return {"ok": True}
 
 @api_router.get("/discover/matches/{match_id}/profile")
-def get_match_profile(match_id: str, user: dict = Depends(get_current_user)):
-    match = _maybe(sb.table("profile_matches").select("*").eq("match_id", match_id).maybe_single().execute())
+async def get_match_profile(match_id: str, user: dict = Depends(get_current_user)):
+    match = _maybe(await sb.table("profile_matches").select("*").eq("match_id", match_id).maybe_single().execute())
     if not match: raise HTTPException(404, "Match not found")
     if user["user_id"] not in [match["user1_id"], match["user2_id"]]: raise HTTPException(403, "Not your match")
     partner_id = match["user2_id"] if match["user1_id"] == user["user_id"] else match["user1_id"]
-    return get_profile({"user_id": partner_id})
+    return await get_profile({"user_id": partner_id})
 
 @api_router.get("/unread-counts")
-def get_unread_counts(user: dict = Depends(get_current_user)):
-    unread_res = sb.table("match_messages").select("match_id").neq("sender_id", user["user_id"]).eq("read", False).execute()
+async def get_unread_counts(user: dict = Depends(get_current_user)):
+    unread_res = await sb.table("match_messages").select("match_id").neq("sender_id", user["user_id"]).eq("read", False).execute()
     match_ids = set()
     for row in (unread_res.data or []):
         match_ids.add(row["match_id"])
@@ -748,7 +715,7 @@ def get_unread_counts(user: dict = Depends(get_current_user)):
     friend_count = 0
     if match_ids:
         for mid in match_ids:
-            match = _maybe(sb.table("profile_matches").select("swipe_type").eq("match_id", mid).maybe_single().execute())
+            match = _maybe(await sb.table("profile_matches").select("swipe_type").eq("match_id", mid).maybe_single().execute())
             if match:
                 if match.get("swipe_type") == "friendship":
                     friend_count += 1
@@ -757,12 +724,12 @@ def get_unread_counts(user: dict = Depends(get_current_user)):
     return {"dating_unread": dating_count, "friend_unread": friend_count}
 
 @api_router.get("/requests")
-def get_requests(user: dict = Depends(get_current_user)):
-    dating = sb.table("dating_requests").select("*").eq("to_user_id", user["user_id"]).eq("status", "pending").execute().data or []
-    friend = sb.table("friend_requests").select("*").eq("to_user_id", user["user_id"]).eq("status", "pending").execute().data or []
+async def get_requests(user: dict = Depends(get_current_user)):
+    dating = (await sb.table("dating_requests").select("*").eq("to_user_id", user["user_id"]).eq("status", "pending").execute()).data or []
+    friend = (await sb.table("friend_requests").select("*").eq("to_user_id", user["user_id"]).eq("status", "pending").execute()).data or []
     result = []
     for req in dating:
-        from_profile = _maybe(sb.table("user_profiles").select("display_name,profile_image,country").eq("user_id", req["from_user_id"]).maybe_single().execute())
+        from_profile = _maybe(await sb.table("user_profiles").select("display_name,profile_image,country").eq("user_id", req["from_user_id"]).maybe_single().execute())
         if from_profile:
             result.append({
                 "request_id": req["request_id"], "type": "dating",
@@ -773,7 +740,7 @@ def get_requests(user: dict = Depends(get_current_user)):
                 "created_at": req["created_at"], "status": req["status"],
             })
     for req in friend:
-        from_profile = _maybe(sb.table("user_profiles").select("display_name,profile_image,country").eq("user_id", req["from_user_id"]).maybe_single().execute())
+        from_profile = _maybe(await sb.table("user_profiles").select("display_name,profile_image,country").eq("user_id", req["from_user_id"]).maybe_single().execute())
         if from_profile:
             result.append({
                 "request_id": req["request_id"], "type": "friend",
@@ -786,28 +753,28 @@ def get_requests(user: dict = Depends(get_current_user)):
     return result
 
 @api_router.post("/requests/{request_id}/respond")
-def respond_request(request_id: str, action: str, user: dict = Depends(get_current_user)):
+async def respond_request(request_id: str, action: str, user: dict = Depends(get_current_user)):
     if action not in ["accept","reject"]:
         raise HTTPException(400, "Action must be 'accept' or 'reject'")
-    req = _maybe(sb.table("dating_requests").select("*").eq("request_id", request_id).eq("to_user_id", user["user_id"]).maybe_single().execute())
+    req = _maybe(await sb.table("dating_requests").select("*").eq("request_id", request_id).eq("to_user_id", user["user_id"]).maybe_single().execute())
     table = "dating_requests"
     if not req:
-        req = _maybe(sb.table("friend_requests").select("*").eq("request_id", request_id).eq("to_user_id", user["user_id"]).maybe_single().execute())
+        req = _maybe(await sb.table("friend_requests").select("*").eq("request_id", request_id).eq("to_user_id", user["user_id"]).maybe_single().execute())
         table = "friend_requests"
     if not req: raise HTTPException(404, "Request not found")
     new_status = "accepted" if action == "accept" else "rejected"
     if req["status"] != "pending": raise HTTPException(400, "Request already handled")
-    sb.table(table).update({"status": new_status, "updated_at": datetime.now(timezone.utc).isoformat()}).eq("request_id", request_id).execute()
+    await sb.table(table).update({"status": new_status, "updated_at": datetime.now(timezone.utc).isoformat()}).eq("request_id", request_id).execute()
     if action == "accept":
         swipe_type = "dating" if table == "dating_requests" else "friendship"
         uid1, uid2 = sorted([user["user_id"], req["from_user_id"]])
-        exist_match = _maybe(sb.table("profile_matches").select("*").eq("user1_id", uid1).eq("user2_id", uid2).eq("swipe_type", swipe_type).maybe_single().execute())
+        exist_match = _maybe(await sb.table("profile_matches").select("*").eq("user1_id", uid1).eq("user2_id", uid2).eq("swipe_type", swipe_type).maybe_single().execute())
         if not exist_match:
             match_id = f"match_{uuid.uuid4().hex[:12]}"
-            sb.table("profile_matches").insert({"match_id": match_id, "user1_id": uid1, "user2_id": uid2, "swipe_type": swipe_type, "created_at": datetime.now(timezone.utc).isoformat()}).execute()
-    from_profile = get_profile(user)
+            await sb.table("profile_matches").insert({"match_id": match_id, "user1_id": uid1, "user2_id": uid2, "swipe_type": swipe_type, "created_at": datetime.now(timezone.utc).isoformat()}).execute()
+    from_profile = await get_profile(user)
     notif_type = "dating_accepted" if table == "dating_requests" else "friend_accepted"
-    sb.table("notifications").insert({
+    await sb.table("notifications").insert({
         "notification_id": f"notif_{uuid.uuid4().hex[:12]}", "user_id": req["from_user_id"], "from_user_id": user["user_id"],
         "type": notif_type, "message": f"{from_profile.get('display_name','Someone')} {action}ed your request",
         "created_at": datetime.now(timezone.utc).isoformat()
@@ -815,25 +782,25 @@ def respond_request(request_id: str, action: str, user: dict = Depends(get_curre
     return {"ok": True, "status": new_status}
 
 @api_router.get("/notifications")
-def get_notifications(user: dict = Depends(get_current_user)):
-    notifs = sb.table("notifications").select("*").eq("user_id", user["user_id"]).order("created_at", desc=True).limit(50).execute().data or []
+async def get_notifications(user: dict = Depends(get_current_user)):
+    notifs = (await sb.table("notifications").select("*").eq("user_id", user["user_id"]).order("created_at", desc=True).limit(50).execute()).data or []
     for n in notifs:
-        from_profile = _maybe(sb.table("user_profiles").select("display_name,profile_image").eq("user_id", n["from_user_id"]).maybe_single().execute())
+        from_profile = _maybe(await sb.table("user_profiles").select("display_name,profile_image").eq("user_id", n["from_user_id"]).maybe_single().execute())
         n["from_name"] = from_profile.get("display_name","Someone") if from_profile else "Someone"
         n["from_image"] = from_profile.get("profile_image","") if from_profile else ""
     return notifs
 
 @api_router.post("/notifications/read")
-def mark_notifications_read(user: dict = Depends(get_current_user)):
-    sb.table("notifications").update({"read": True}).eq("user_id", user["user_id"]).eq("read", False).execute()
+async def mark_notifications_read(user: dict = Depends(get_current_user)):
+    await sb.table("notifications").update({"read": True}).eq("user_id", user["user_id"]).eq("read", False).execute()
     return {"ok": True}
 
 # ---------- Report / Block ----------
 @api_router.post("/report")
-def report_user(payload: ReportPayload, user: dict = Depends(get_current_user)):
-    existing = _maybe(sb.table("user_reports").select("report_id").eq("reporter_id", user["user_id"]).eq("reported_user_id", payload.reported_user_id).maybe_single().execute())
+async def report_user(payload: ReportPayload, user: dict = Depends(get_current_user)):
+    existing = _maybe(await sb.table("user_reports").select("report_id").eq("reporter_id", user["user_id"]).eq("reported_user_id", payload.reported_user_id).maybe_single().execute())
     if existing: raise HTTPException(400, "Already reported")
-    sb.table("user_reports").insert({
+    await sb.table("user_reports").insert({
         "report_id": f"rep_{uuid.uuid4().hex[:12]}",
         "reporter_id": user["user_id"], "reported_user_id": payload.reported_user_id,
         "reason": payload.reason or ""
@@ -841,92 +808,92 @@ def report_user(payload: ReportPayload, user: dict = Depends(get_current_user)):
     return {"ok": True}
 
 @api_router.post("/block")
-def block_user(payload: BlockPayload, user: dict = Depends(get_current_user)):
-    existing = _maybe(sb.table("user_blocks").select("block_id").eq("blocker_id", user["user_id"]).eq("blocked_user_id", payload.blocked_user_id).maybe_single().execute())
+async def block_user(payload: BlockPayload, user: dict = Depends(get_current_user)):
+    existing = _maybe(await sb.table("user_blocks").select("block_id").eq("blocker_id", user["user_id"]).eq("blocked_user_id", payload.blocked_user_id).maybe_single().execute())
     if existing: raise HTTPException(400, "Already blocked")
-    sb.table("user_blocks").insert({
+    await sb.table("user_blocks").insert({
         "block_id": f"blk_{uuid.uuid4().hex[:12]}",
         "blocker_id": user["user_id"], "blocked_user_id": payload.blocked_user_id
     }).execute()
-    sb.table("profile_matches").delete().or_(f"and(user1_id.eq.{user['user_id']},user2_id.eq.{payload.blocked_user_id}),and(user1_id.eq.{payload.blocked_user_id},user2_id.eq.{user['user_id']})").execute()
+    await sb.table("profile_matches").delete().or_(f"and(user1_id.eq.{user['user_id']},user2_id.eq.{payload.blocked_user_id}),and(user1_id.eq.{payload.blocked_user_id},user2_id.eq.{user['user_id']})").execute()
     return {"ok": True}
 
-# ---------- Stories ----------
+# ---------- Stories (async) ----------
 @api_router.post("/stories")
-def create_story(payload: CreateStoryPayload, user: dict = Depends(get_current_user)):
+async def create_story(payload: CreateStoryPayload, user: dict = Depends(get_current_user)):
     if contains_profanity(payload.content):
         raise HTTPException(400, "Story contains inappropriate language")
     if payload.category not in ["HIV","HPV","HSV","Other STD"]: raise HTTPException(400)
-    profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
+    profile = _maybe(await sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
     author_avatar = profile.get("profile_image") if profile else user.get("picture","")
     story = {"story_id": f"story_{uuid.uuid4().hex[:12]}", "user_id": user["user_id"],
              "author_name": profile.get("display_name", user.get("name","")),
              "author_avatar": author_avatar,
              "content": payload.content, "category": payload.category, "title": payload.title or "",
              "likes": 0, "comment_count": 0, "created_at": datetime.now(timezone.utc).isoformat()}
-    sb.table("stories").insert(story).execute()
+    await sb.table("stories").insert(story).execute()
     return {"ok": True, "story": story}
 
 @api_router.get("/stories")
-def get_stories(category: Optional[str] = None, user: dict = Depends(get_current_user)):
+async def get_stories(category: Optional[str] = None, user: dict = Depends(get_current_user)):
     query = sb.table("stories").select("*").order("created_at", desc=True).limit(100)
     if category: query = query.eq("category", category)
-    stories = (query.execute()).data or []
+    stories = (await query.execute()).data or []
     for s in stories:
-        like = _maybe(sb.table("story_likes").select("like_id").eq("user_id", user["user_id"]).eq("story_id", s["story_id"]).maybe_single().execute())
+        like = _maybe(await sb.table("story_likes").select("like_id").eq("user_id", user["user_id"]).eq("story_id", s["story_id"]).maybe_single().execute())
         s["liked_by_user"] = like is not None
     return stories
 
 @api_router.get("/stories/{story_id}")
-def get_story(story_id: str, user: dict = Depends(get_current_user)):
-    story = _maybe(sb.table("stories").select("*").eq("story_id", story_id).maybe_single().execute())
+async def get_story(story_id: str, user: dict = Depends(get_current_user)):
+    story = _maybe(await sb.table("stories").select("*").eq("story_id", story_id).maybe_single().execute())
     if not story: raise HTTPException(404)
-    like = _maybe(sb.table("story_likes").select("like_id").eq("user_id", user["user_id"]).eq("story_id", story_id).maybe_single().execute())
+    like = _maybe(await sb.table("story_likes").select("like_id").eq("user_id", user["user_id"]).eq("story_id", story_id).maybe_single().execute())
     story["liked_by_user"] = like is not None
-    comments = sb.table("story_comments").select("*").eq("story_id", story_id).order("created_at").execute().data or []
+    comments = (await sb.table("story_comments").select("*").eq("story_id", story_id).order("created_at").execute()).data or []
     story["comments"] = build_comment_tree(comments)
     return story
 
 @api_router.post("/stories/{story_id}/like")
-def like_story(story_id: str, user: dict = Depends(get_current_user)):
-    existing = _maybe(sb.table("story_likes").select("*").eq("user_id", user["user_id"]).eq("story_id", story_id).maybe_single().execute())
-    story = _maybe(sb.table("stories").select("likes").eq("story_id", story_id).maybe_single().execute())
+async def like_story(story_id: str, user: dict = Depends(get_current_user)):
+    existing = _maybe(await sb.table("story_likes").select("*").eq("user_id", user["user_id"]).eq("story_id", story_id).maybe_single().execute())
+    story = _maybe(await sb.table("stories").select("likes").eq("story_id", story_id).maybe_single().execute())
     if not story: raise HTTPException(404)
     current = story.get("likes",0)
     if existing:
-        sb.table("story_likes").delete().eq("like_id", existing["like_id"]).execute()
-        sb.table("stories").update({"likes": max(current-1,0)}).eq("story_id", story_id).execute()
+        await sb.table("story_likes").delete().eq("like_id", existing["like_id"]).execute()
+        await sb.table("stories").update({"likes": max(current-1,0)}).eq("story_id", story_id).execute()
         return {"ok": True, "liked": False}
-    sb.table("story_likes").insert({"like_id": f"like_{uuid.uuid4().hex[:12]}", "user_id": user["user_id"], "story_id": story_id}).execute()
-    sb.table("stories").update({"likes": current+1}).eq("story_id", story_id).execute()
+    await sb.table("story_likes").insert({"like_id": f"like_{uuid.uuid4().hex[:12]}", "user_id": user["user_id"], "story_id": story_id}).execute()
+    await sb.table("stories").update({"likes": current+1}).eq("story_id", story_id).execute()
     return {"ok": True, "liked": True}
 
 @api_router.post("/stories/{story_id}/comments")
-def create_comment(story_id: str, payload: CreateCommentPayload, user: dict = Depends(get_current_user)):
+async def create_comment(story_id: str, payload: CreateCommentPayload, user: dict = Depends(get_current_user)):
     if contains_profanity(payload.content):
         raise HTTPException(400, "Comment contains inappropriate language")
-    story = _maybe(sb.table("stories").select("story_id,comment_count").eq("story_id", story_id).maybe_single().execute())
+    story = _maybe(await sb.table("stories").select("story_id,comment_count").eq("story_id", story_id).maybe_single().execute())
     if not story: raise HTTPException(404)
     if payload.parent_id:
-        parent = _maybe(sb.table("story_comments").select("comment_id").eq("comment_id", payload.parent_id).maybe_single().execute())
+        parent = _maybe(await sb.table("story_comments").select("comment_id").eq("comment_id", payload.parent_id).maybe_single().execute())
         if not parent: raise HTTPException(404)
-    profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
+    profile = _maybe(await sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
     author_avatar = profile.get("profile_image") if profile else user.get("picture","")
     comment = {"comment_id": f"cmt_{uuid.uuid4().hex[:12]}", "story_id": story_id, "user_id": user["user_id"],
                "author_name": profile.get("display_name", user.get("name","")),
                "author_avatar": author_avatar,
                "content": payload.content, "parent_id": payload.parent_id, "likes": 0, "reply_count": 0,
                "created_at": datetime.now(timezone.utc).isoformat()}
-    sb.table("story_comments").insert(comment).execute()
-    sb.table("stories").update({"comment_count": story.get("comment_count",0)+1}).eq("story_id", story_id).execute()
+    await sb.table("story_comments").insert(comment).execute()
+    await sb.table("stories").update({"comment_count": story.get("comment_count",0)+1}).eq("story_id", story_id).execute()
     if payload.parent_id:
-        pc = _maybe(sb.table("story_comments").select("reply_count").eq("comment_id", payload.parent_id).maybe_single().execute())
-        if pc: sb.table("story_comments").update({"reply_count": pc.get("reply_count",0)+1}).eq("comment_id", payload.parent_id).execute()
+        pc = _maybe(await sb.table("story_comments").select("reply_count").eq("comment_id", payload.parent_id).maybe_single().execute())
+        if pc: await sb.table("story_comments").update({"reply_count": pc.get("reply_count",0)+1}).eq("comment_id", payload.parent_id).execute()
     return {"ok": True, "comment": comment}
 
 @api_router.put("/stories/{story_id}")
-def edit_story(story_id: str, payload: CreateStoryPayload, user: dict = Depends(get_current_user)):
-    story = _maybe(sb.table("stories").select("*").eq("story_id", story_id).maybe_single().execute())
+async def edit_story(story_id: str, payload: CreateStoryPayload, user: dict = Depends(get_current_user)):
+    story = _maybe(await sb.table("stories").select("*").eq("story_id", story_id).maybe_single().execute())
     if not story: raise HTTPException(404, "Story not found")
     if story["user_id"] != user["user_id"]: raise HTTPException(403, "Not your story")
     updates = {}
@@ -935,42 +902,42 @@ def edit_story(story_id: str, payload: CreateStoryPayload, user: dict = Depends(
     if payload.category is not None: updates["category"] = payload.category
     if updates:
         updates["updated_at"] = datetime.now(timezone.utc).isoformat()
-        sb.table("stories").update(updates).eq("story_id", story_id).execute()
+        await sb.table("stories").update(updates).eq("story_id", story_id).execute()
     return {"ok": True}
 
 @api_router.delete("/stories/{story_id}")
-def delete_story(story_id: str, user: dict = Depends(get_current_user)):
-    story = _maybe(sb.table("stories").select("*").eq("story_id", story_id).maybe_single().execute())
+async def delete_story(story_id: str, user: dict = Depends(get_current_user)):
+    story = _maybe(await sb.table("stories").select("*").eq("story_id", story_id).maybe_single().execute())
     if not story: raise HTTPException(404, "Story not found")
     if story["user_id"] != user["user_id"]: raise HTTPException(403, "Not your story")
-    sb.table("story_comments").delete().eq("story_id", story_id).execute()
-    sb.table("story_likes").delete().eq("story_id", story_id).execute()
-    sb.table("stories").delete().eq("story_id", story_id).execute()
+    await sb.table("story_comments").delete().eq("story_id", story_id).execute()
+    await sb.table("story_likes").delete().eq("story_id", story_id).execute()
+    await sb.table("stories").delete().eq("story_id", story_id).execute()
     return {"ok": True}
 
 @api_router.put("/stories/{story_id}/comments/{comment_id}")
-def edit_comment(story_id: str, comment_id: str, payload: CreateCommentPayload, user: dict = Depends(get_current_user)):
-    comment = _maybe(sb.table("story_comments").select("*").eq("comment_id", comment_id).eq("story_id", story_id).maybe_single().execute())
+async def edit_comment(story_id: str, comment_id: str, payload: CreateCommentPayload, user: dict = Depends(get_current_user)):
+    comment = _maybe(await sb.table("story_comments").select("*").eq("comment_id", comment_id).eq("story_id", story_id).maybe_single().execute())
     if not comment: raise HTTPException(404, "Comment not found")
     if comment["user_id"] != user["user_id"]: raise HTTPException(403, "Not your comment")
-    sb.table("story_comments").update({"content": payload.content}).eq("comment_id", comment_id).execute()
+    await sb.table("story_comments").update({"content": payload.content}).eq("comment_id", comment_id).execute()
     return {"ok": True}
 
 @api_router.delete("/stories/{story_id}/comments/{comment_id}")
-def delete_comment(story_id: str, comment_id: str, user: dict = Depends(get_current_user)):
-    comment = _maybe(sb.table("story_comments").select("*").eq("comment_id", comment_id).eq("story_id", story_id).maybe_single().execute())
+async def delete_comment(story_id: str, comment_id: str, user: dict = Depends(get_current_user)):
+    comment = _maybe(await sb.table("story_comments").select("*").eq("comment_id", comment_id).eq("story_id", story_id).maybe_single().execute())
     if not comment: raise HTTPException(404, "Comment not found")
     if comment["user_id"] != user["user_id"]: raise HTTPException(403, "Not your comment")
-    def delete_replies(parent_id):
-        replies = sb.table("story_comments").select("comment_id").eq("parent_id", parent_id).execute().data or []
+    async def delete_replies(parent_id):
+        replies = (await sb.table("story_comments").select("comment_id").eq("parent_id", parent_id).execute()).data or []
         for reply in replies:
-            delete_replies(reply["comment_id"])
-            sb.table("story_comments").delete().eq("comment_id", reply["comment_id"]).execute()
-    delete_replies(comment_id)
-    sb.table("story_comments").delete().eq("comment_id", comment_id).execute()
-    remaining = sb.table("story_comments").select("comment_id", count="exact").eq("story_id", story_id).execute()
+            await delete_replies(reply["comment_id"])
+            await sb.table("story_comments").delete().eq("comment_id", reply["comment_id"]).execute()
+    await delete_replies(comment_id)
+    await sb.table("story_comments").delete().eq("comment_id", comment_id).execute()
+    remaining = await sb.table("story_comments").select("comment_id", count="exact").eq("story_id", story_id).execute()
     new_count = remaining.count if hasattr(remaining, 'count') else 0
-    sb.table("stories").update({"comment_count": new_count}).eq("story_id", story_id).execute()
+    await sb.table("stories").update({"comment_count": new_count}).eq("story_id", story_id).execute()
     return {"ok": True}
 
 def build_comment_tree(comments):
