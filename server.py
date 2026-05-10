@@ -49,7 +49,7 @@ api_router = APIRouter(prefix="/api")
 # ---------- Constants ----------
 EARTH_RADIUS_KM = 6371
 MAX_GPS_AGE_HOURS = 24
-STORAGE_BUCKET = "avatars"   # your bucket – make sure it's public in Supabase
+STORAGE_BUCKET = "avatars"
 
 # ---------- Helpers ----------
 def _parse_dt(value):
@@ -111,7 +111,7 @@ async def get_location_from_ip(ip: str) -> tuple:
         logger.error(f"IP geolocation failed: {e}")
     return None
 
-# ---------- Image Helpers ----------
+# ---------- Image Helpers (WebP) ----------
 def compress_image(base64_str: str, max_size_kb: int = 300) -> bytes:
     if "," in base64_str:
         base64_str = base64_str.split(",", 1)[1]
@@ -125,7 +125,7 @@ def compress_image(base64_str: str, max_size_kb: int = 300) -> bytes:
     quality = 85
     while True:
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=quality)
+        img.save(buf, format="WEBP", quality=quality)
         size_kb = buf.tell() / 1024
         if size_kb <= max_size_kb or quality <= 20:
             break
@@ -138,7 +138,7 @@ def upload_image_to_supabase(file_bytes: bytes, user_id: str, filename: str) -> 
         path=path,
         file=file_bytes,
         file_options={
-            "content-type": "image/jpeg",
+            "content-type": "image/webp",
             "cache-control": "public, max-age=31536000, immutable"
         }
     )
@@ -151,7 +151,7 @@ def process_image_field(image_value: str, user_id: str, filename_prefix: str) ->
     if image_value.startswith("data:image") or (len(image_value) > 1000 and "base64" in image_value):
         try:
             compressed = compress_image(image_value)
-            filename = f"{filename_prefix}_{uuid.uuid4().hex[:8]}.jpg"
+            filename = f"{filename_prefix}_{uuid.uuid4().hex[:8]}.jpg"   # extension doesn't matter, content-type is webp
             return upload_image_to_supabase(compressed, user_id, filename)
         except Exception as e:
             logger.error(f"Image compression/upload failed: {e}")
@@ -647,7 +647,6 @@ def get_matches(swipe_type: Optional[str] = 'dating', user: dict = Depends(get_c
         partner_id = m["user2_id"] if m["user1_id"] == user["user_id"] else m["user1_id"]
         profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", partner_id).maybe_single().execute())
         if profile:
-            # count unread messages from the partner
             unread_res = sb.table("match_messages").select("message_id", count="exact").eq("match_id", m["match_id"]).eq("read", False).eq("sender_id", partner_id).execute()
             unread = unread_res.count if hasattr(unread_res, 'count') else 0
             result.append({
@@ -698,14 +697,8 @@ def unmatch(match_id: str, user: dict = Depends(get_current_user)):
         raise HTTPException(404, "Match not found")
     if user["user_id"] not in [match["user1_id"], match["user2_id"]]:
         raise HTTPException(403, "Not your match")
-
-    # Delete all messages for this match
     sb.table("match_messages").delete().eq("match_id", match_id).execute()
-
-    # Delete the match itself
     sb.table("profile_matches").delete().eq("match_id", match_id).execute()
-
-    # Optionally, delete any pending requests between these two users
     uid1, uid2 = match["user1_id"], match["user2_id"]
     sb.table("dating_requests").delete() \
         .or_(f"from_user_id.eq.{uid1},to_user_id.eq.{uid1}") \
@@ -715,13 +708,10 @@ def unmatch(match_id: str, user: dict = Depends(get_current_user)):
         .or_(f"from_user_id.eq.{uid1},to_user_id.eq.{uid1}") \
         .or_(f"from_user_id.eq.{uid2},to_user_id.eq.{uid2}") \
         .execute()
-
-    # Remove swipes between them (so they can match again later if they want)
     sb.table("profile_swipes").delete() \
         .or_(f"swiper_id.eq.{uid1},swiped_id.eq.{uid1}") \
         .or_(f"swiper_id.eq.{uid2},swiped_id.eq.{uid2}") \
         .execute()
-
     return {"ok": True}
 
 @api_router.get("/unread-counts")
@@ -734,7 +724,6 @@ def get_unread_counts(user: dict = Depends(get_current_user)):
     match_ids = set()
     for row in (unread_res.data or []):
         match_ids.add(row["match_id"])
-
     dating_count = 0
     friend_count = 0
     if match_ids:
@@ -850,7 +839,6 @@ def get_stories(category: Optional[str] = None, user: dict = Depends(get_current
     for s in stories:
         like = _maybe(sb.table("story_likes").select("like_id").eq("user_id", user["user_id"]).eq("story_id", s["story_id"]).maybe_single().execute())
         s["liked_by_user"] = like is not None
-        # No need to transform avatar URL; it's already a public Supabase URL
     return stories
 
 @api_router.get("/stories/{story_id}")
