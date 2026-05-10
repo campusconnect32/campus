@@ -11,19 +11,17 @@ from datetime import datetime, timezone, timedelta
 from PIL import Image
 import httpx as httpx_lib
 
-
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-# Create a custom HTTP client that disables HTTP/2
+SUPABASE_URL = os.environ['SUPABASE_URL']
+SUPABASE_KEY = os.environ['SUPABASE_SERVICE_ROLE_KEY']
+
+# Create a custom HTTP client that forces HTTP/1.1 (no HTTP/2)
 http_client = httpx_lib.Client(http2=False)
 
-# Create Supabase client normally
-sb: Client = create_client(SUPABASE_URL.rstrip('/'), SUPABASE_KEY)
-
-# Override the internal httpx client used by postgrest
-sb.postgrest.session = http_client
-
+# Create Supabase client with that custom client
+sb: Client = create_client(SUPABASE_URL.rstrip('/'), SUPABASE_KEY, http_client=http_client)
 
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
