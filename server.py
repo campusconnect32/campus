@@ -28,14 +28,7 @@ logger = logging.getLogger(__name__)
 # ---------- CORS ----------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://havenpositive.online",
-        "https://www.havenpositive.online",
-        "https://haven-83b20.web.app",
-        "https://haven-83b20.firebaseapp.com",
-        "https://haven-hmwq.onrender.com",
-        "http://localhost:3000",
-    ],
+    allow_origins=["https://havenpositive.online","https://www.havenpositive.online","https://haven-83b20.web.app","https://haven-83b20.firebaseapp.com","https://haven-hmwq.onrender.com","http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -53,7 +46,7 @@ GOLD_DAYS = 30
 PREMIUM_COST = 199
 PREMIUM_DAYS = 180
 
-PROFANITY_LIST = {"fuck", "shit", "bitch", "asshole", "bastard", "dick", "pussy", "cunt", "whore"}
+PROFANITY_LIST = {"fuck","shit","bitch","asshole","bastard","dick","pussy","cunt","whore"}
 
 def contains_profanity(text: str) -> bool:
     if not text: return False
@@ -177,6 +170,11 @@ class GoogleAuthPayload(BaseModel):
 
 class ProfileSetupPayload(BaseModel):
     date_of_birth: str; gender: str; health_status: str
+    sexual_orientation: Optional[str] = ""   # new
+    positive_since: Optional[str] = ""        # new
+    height: Optional[str] = ""                # new
+    ethnicity: Optional[str] = ""             # new
+    religion: Optional[str] = ""              # new
     display_name: Optional[str] = ""; bio: Optional[str] = ""
     interests: Optional[str] = ""; looking_for: Optional[str] = ""
     education: Optional[str] = ""; kids: Optional[str] = ""
@@ -192,6 +190,11 @@ class ProfileSetupPayload(BaseModel):
 
 class ProfileUpdatePayload(BaseModel):
     date_of_birth: Optional[str] = None; gender: Optional[str] = None; health_status: Optional[str] = None
+    sexual_orientation: Optional[str] = None   # new
+    positive_since: Optional[str] = None        # new
+    height: Optional[str] = None                # new
+    ethnicity: Optional[str] = None             # new
+    religion: Optional[str] = None              # new
     display_name: Optional[str] = None; bio: Optional[str] = None; interests: Optional[str] = None
     looking_for: Optional[str] = None; education: Optional[str] = None; kids: Optional[str] = None
     want_kids: Optional[str] = None; smoke: Optional[str] = None; drink: Optional[str] = None
@@ -430,6 +433,7 @@ def get_profile(user: dict) -> dict:
             "user_id": user["user_id"], "email": user.get("email",""), "name": user.get("name",""),
             "date_of_birth": None, "gender": None, "country": None, "city": None,
             "health_status": None, "latitude": None, "longitude": None,
+            "sexual_orientation": "", "positive_since": "", "height": "", "ethnicity": "", "religion": "",
             "display_name": user.get("name",""), "bio": "", "interests": "", "looking_for": "",
             "education": "", "kids": "", "want_kids": "", "smoke": "", "drink": "", "employment": "",
             "profile_image": user.get("picture",""), "gallery_images": [],
@@ -452,6 +456,11 @@ def get_profile(user: dict) -> dict:
         "country": country, "city": city,
         "health_status": profile.get("health_status"),
         "latitude": lat, "longitude": lon,
+        "sexual_orientation": profile.get("sexual_orientation",""),
+        "positive_since": profile.get("positive_since",""),
+        "height": profile.get("height",""),
+        "ethnicity": profile.get("ethnicity",""),
+        "religion": profile.get("religion",""),
         "display_name": profile.get("display_name", user.get("name","")),
         "bio": profile.get("bio",""), "interests": profile.get("interests",""),
         "looking_for": profile.get("looking_for",""),
@@ -491,6 +500,11 @@ def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current
     profile_data = {
         "user_id": user["user_id"], "date_of_birth": payload.date_of_birth, "gender": payload.gender,
         "country": country, "city": city, "health_status": payload.health_status,
+        "sexual_orientation": payload.sexual_orientation or "",
+        "positive_since": payload.positive_since or "",
+        "height": payload.height or "",
+        "ethnicity": payload.ethnicity or "",
+        "religion": payload.religion or "",
         "latitude": lat, "longitude": lon,
         "display_name": payload.display_name or user.get("name",""),
         "bio": payload.bio or "", "interests": payload.interests or "",
@@ -525,7 +539,9 @@ def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current
 def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_current_user)):
     updates = {}
     all_fields = [
-        "date_of_birth", "gender", "health_status", "display_name", "bio", "interests", "looking_for",
+        "date_of_birth", "gender", "health_status",
+        "sexual_orientation", "positive_since", "height", "ethnicity", "religion",
+        "display_name", "bio", "interests", "looking_for",
         "education", "kids", "want_kids", "smoke", "drink", "employment",
         "pref_gender", "pref_min_age", "pref_max_age", "pref_country",
         "pref_max_distance", "pref_health_status",
@@ -929,80 +945,51 @@ def build_comment_tree(comments):
 # ---------- Flexer Board ----------
 @api_router.post("/flexer/join")
 def flexer_join(amount: int = 6, user: dict = Depends(get_current_user)):
-    if amount < 6:
-        raise HTTPException(400, "Minimum 6 diamonds required to join the Flexer Board")
-    if user.get("diamonds", 0) < amount:
-        raise HTTPException(402, "Not enough diamonds")
+    if amount < 6: raise HTTPException(400, "Minimum 6 diamonds")
+    if user.get("diamonds",0) < amount: raise HTTPException(402)
     now = datetime.now(timezone.utc)
-    existing = _maybe(sb.table("flexer_cards").select("*").eq("user_id", user["user_id"]).gt("expires_at", now.isoformat()).maybe_single().execute())
+    existing = _maybe(sb.table("flexer_cards").select("*").eq("user_id",user["user_id"]).gt("expires_at",now.isoformat()).maybe_single().execute())
     new_diamonds = user["diamonds"] - amount
     if existing:
         new_total = existing["diamonds_committed"] + amount
         new_expiry = max(_parse_dt(existing["expires_at"]), now) + timedelta(days=30)
-        sb.table("flexer_cards").update({
-            "diamonds_committed": new_total,
-            "expires_at": new_expiry.isoformat(),
-            "last_renewed_at": now.isoformat()
-        }).eq("card_id", existing["card_id"]).execute()
+        sb.table("flexer_cards").update({"diamonds_committed":new_total,"expires_at":new_expiry.isoformat(),"last_renewed_at":now.isoformat()}).eq("card_id",existing["card_id"]).execute()
     else:
         card_id = f"flex_{uuid.uuid4().hex[:12]}"
         expires = now + timedelta(days=30)
-        sb.table("flexer_cards").insert({
-            "card_id": card_id,
-            "user_id": user["user_id"],
-            "diamonds_committed": amount,
-            "created_at": now.isoformat(),
-            "expires_at": expires.isoformat(),
-            "last_renewed_at": now.isoformat()
-        }).execute()
-    sb.table("users").update({"diamonds": new_diamonds}).eq("user_id", user["user_id"]).execute()
-    return {"ok": True, "diamonds_spent": amount, "diamonds_remaining": new_diamonds}
+        sb.table("flexer_cards").insert({"card_id":card_id,"user_id":user["user_id"],"diamonds_committed":amount,"created_at":now.isoformat(),"expires_at":expires.isoformat(),"last_renewed_at":now.isoformat()}).execute()
+    sb.table("users").update({"diamonds":new_diamonds}).eq("user_id",user["user_id"]).execute()
+    return {"ok":True}
 
 @api_router.post("/flexer/increment")
-def flexer_increment(amount: int, user: dict = Depends(get_current_user)):
-    if amount < 1:
-        raise HTTPException(400, "Must add at least 1 diamond")
-    if user.get("diamonds", 0) < amount:
-        raise HTTPException(402, "Not enough diamonds")
-    existing = _maybe(sb.table("flexer_cards").select("*").eq("user_id", user["user_id"]).gt("expires_at", datetime.now(timezone.utc).isoformat()).maybe_single().execute())
-    if not existing:
-        raise HTTPException(400, "You need an active Flexer card first")
-    card_age = datetime.now(timezone.utc) - _parse_dt(existing["created_at"])
-    if card_age > timedelta(days=365):
-        raise HTTPException(400, "Card has exceeded 12‑month lifetime. Create a new one.")
-    new_total = existing["diamonds_committed"] + amount
-    new_diamonds = user["diamonds"] - amount
-    sb.table("flexer_cards").update({"diamonds_committed": new_total}).eq("card_id", existing["card_id"]).execute()
-    sb.table("users").update({"diamonds": new_diamonds}).eq("user_id", user["user_id"]).execute()
-    return {"ok": True, "total_diamonds": new_total, "diamonds_remaining": new_diamonds}
+def flexer_increment(amount:int, user:dict=Depends(get_current_user)):
+    if amount<1: raise HTTPException(400)
+    if user.get("diamonds",0)<amount: raise HTTPException(402)
+    existing = _maybe(sb.table("flexer_cards").select("*").eq("user_id",user["user_id"]).gt("expires_at",datetime.now(timezone.utc).isoformat()).maybe_single().execute())
+    if not existing: raise HTTPException(400)
+    if (datetime.now(timezone.utc)-_parse_dt(existing["created_at"]))>timedelta(days=365): raise HTTPException(400)
+    new_total = existing["diamonds_committed"]+amount
+    new_diamonds = user["diamonds"]-amount
+    sb.table("flexer_cards").update({"diamonds_committed":new_total}).eq("card_id",existing["card_id"]).execute()
+    sb.table("users").update({"diamonds":new_diamonds}).eq("user_id",user["user_id"]).execute()
+    return {"ok":True}
 
 @api_router.get("/flexer/board")
-def flexer_board(user: dict = Depends(get_current_user)):
+def flexer_board(user:dict=Depends(get_current_user)):
     now = datetime.now(timezone.utc).isoformat()
-    cards = sb.table("flexer_cards").select("*").gt("expires_at", now).order("diamonds_committed", desc=True).limit(100).execute().data or []
-    result = []
-    for card in cards:
-        profile = _maybe(sb.table("user_profiles").select("display_name,profile_image,date_of_birth,country,city,health_status").eq("user_id", card["user_id"]).maybe_single().execute())
+    cards = sb.table("flexer_cards").select("*").gt("expires_at",now).order("diamonds_committed",desc=True).limit(100).execute().data or []
+    result=[]
+    for c in cards:
+        profile = _maybe(sb.table("user_profiles").select("display_name,profile_image,date_of_birth,country,city,health_status").eq("user_id",c["user_id"]).maybe_single().execute())
         if profile:
-            age = None
+            age=None
             if profile.get("date_of_birth"):
                 try:
-                    dob = datetime.fromisoformat(str(profile["date_of_birth"])).date()
-                    today = datetime.now(timezone.utc).date()
-                    age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+                    dob=datetime.fromisoformat(str(profile["date_of_birth"])).date()
+                    today=datetime.now(timezone.utc).date()
+                    age=today.year-dob.year-((today.month,today.day)<(dob.month,dob.day))
                 except: pass
-            result.append({
-                "card_id": card["card_id"],
-                "user_id": card["user_id"],
-                "display_name": profile.get("display_name", "Someone"),
-                "profile_image": profile.get("profile_image", ""),
-                "age": age,
-                "country": profile.get("country", ""),
-                "city": profile.get("city", ""),
-                "health_status": profile.get("health_status"),
-                "diamonds_committed": card["diamonds_committed"],
-                "expires_at": card["expires_at"],
-            })
+            result.append({"card_id":c["card_id"],"user_id":c["user_id"],"display_name":profile.get("display_name","Someone"),"profile_image":profile.get("profile_image",""),"age":age,"country":profile.get("country",""),"city":profile.get("city",""),"health_status":profile.get("health_status"),"diamonds_committed":c["diamonds_committed"],"expires_at":c["expires_at"]})
     return result
 
 # ---------- Countries/Cities ----------
@@ -1010,21 +997,21 @@ def flexer_board(user: dict = Depends(get_current_user)):
 def get_countries():
     try:
         resp = httpx.get("https://restcountries.com/v3.1/all?fields=name,cca2", timeout=5)
-        if resp.status_code == 200: return [{"code": c["cca2"], "name": c["name"]["common"]} for c in resp.json()]
+        if resp.status_code == 200: return [{"code":c["cca2"],"name":c["name"]["common"]} for c in resp.json()]
     except: pass
-    return [{"code":"ZA","name":"South Africa"}, {"code":"US","name":"United States"}, {"code":"GB","name":"United Kingdom"}, {"code":"CA","name":"Canada"}, {"code":"AU","name":"Australia"}, {"code":"IN","name":"India"}]
+    return [{"code":"ZA","name":"South Africa"},{"code":"US","name":"United States"},{"code":"GB","name":"United Kingdom"},{"code":"CA","name":"Canada"},{"code":"AU","name":"Australia"},{"code":"IN","name":"India"}]
 
 @api_router.get("/location/cities")
-def get_cities(country: str):
+def get_cities(country:str):
     try:
-        resp = httpx.post("https://countriesnow.space/api/v0.1/countries/cities", json={"country": country}, timeout=5)
-        if resp.status_code == 200 and not resp.json().get("error"): return [{"name": c} for c in resp.json().get("data", [])]
+        resp = httpx.post("https://countriesnow.space/api/v0.1/countries/cities", json={"country":country}, timeout=5)
+        if resp.status_code==200 and not resp.json().get("error"): return [{"name":c} for c in resp.json().get("data",[])]
     except: pass
-    fallback = {"South Africa": ["Johannesburg","Cape Town","Durban"], "United States": ["New York","Los Angeles","Chicago"]}
-    return [{"name": c} for c in fallback.get(country, [])]
+    fallback = {"South Africa":["Johannesburg","Cape Town","Durban"],"United States":["New York","Los Angeles","Chicago"]}
+    return [{"name":c} for c in fallback.get(country,[])]
 
 app.include_router(api_router)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT",8000)))
