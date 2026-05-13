@@ -158,12 +158,11 @@ def is_premium(user: dict) -> bool:
     tier = user.get("premium_tier")
     if not tier: return False
     expires = user.get("premium_expires_at")
-    if not expires: return True   # no expiry – still valid? Should have expiry
+    if not expires: return True
     return _parse_dt(expires) > datetime.now(timezone.utc)
 
 def require_token(user: dict, cost: int = 1):
-    if is_premium(user):
-        return  # no charge for premium
+    if is_premium(user): return
     if user.get("tokens", 0) < cost:
         raise HTTPException(status_code=402, detail="Not enough tokens")
     sb.table("users").update({"tokens": user["tokens"] - cost}).eq("user_id", user["user_id"]).execute()
@@ -233,11 +232,30 @@ def get_current_user(
     if _parse_dt(session["expires_at"]) < datetime.now(timezone.utc): raise HTTPException(status_code=401)
     user = _maybe(sb.table("users").select("*").eq("user_id", session["user_id"]).maybe_single().execute())
     if not user: raise HTTPException(status_code=401, detail="User not found")
-    # Refresh premium status
-    if is_premium(user) is False and user.get("premium_tier"):
-        sb.table("users").update({"premium_tier": None, "premium_expires_at": None}).eq("user_id", user["user_id"]).execute()
-        user["premium_tier"] = None
-        user["premium_expires_at"] = None
+
+    # Auto‑renew / expiry check
+    old_tier = user.get("premium_tier")
+    if old_tier and not is_premium(user):
+        if user.get("auto_renew"):
+            cost = GOLD_COST if old_tier == "gold" else PREMIUM_COST
+            days = GOLD_DAYS if old_tier == "gold" else PREMIUM_DAYS
+            if user.get("diamonds", 0) >= cost:
+                new_diamonds = user["diamonds"] - cost
+                new_expires = datetime.now(timezone.utc) + timedelta(days=days)
+                sb.table("users").update({"diamonds": new_diamonds, "premium_expires_at": new_expires.isoformat()}).eq("user_id", user["user_id"]).execute()
+                user["diamonds"] = new_diamonds
+                user["premium_expires_at"] = new_expires.isoformat()
+            else:
+                sb.table("users").update({"premium_tier": None, "premium_expires_at": None, "auto_renew": False}).eq("user_id", user["user_id"]).execute()
+                user["premium_tier"] = None
+                user["premium_expires_at"] = None
+                user["auto_renew"] = False
+                notify_user(user["user_id"], "auto_renew_failed", "Auto‑renewal failed – insufficient diamonds. Premium expired.")
+        else:
+            sb.table("users").update({"premium_tier": None, "premium_expires_at": None}).eq("user_id", user["user_id"]).execute()
+            user["premium_tier"] = None
+            user["premium_expires_at"] = None
+
     sb.table("users").update({"last_active": datetime.now(timezone.utc).isoformat()}).eq("user_id", user["user_id"]).execute()
     return user
 
@@ -294,6 +312,7 @@ def auth_me(user: dict = Depends(get_current_user)):
         "verified": user.get("verified", False),
         "premium_tier": user.get("premium_tier"),
         "premium_expires_at": user.get("premium_expires_at"),
+        "auto_renew": user.get("auto_renew", False),
     }
 
 @api_router.post("/auth/logout")
@@ -311,14 +330,13 @@ def purchase_verify(user: dict = Depends(get_current_user)):
     if user.get("diamonds", 0) < VERIFY_COST: raise HTTPException(402, "Not enough diamonds")
     new_diamonds = user["diamonds"] - VERIFY_COST
     sb.table("users").update({"diamonds": new_diamonds, "verified": True}).eq("user_id", user["user_id"]).execute()
-    sb.table("diamond_purchases").insert({
-        "purchase_id": f"pur_{uuid.uuid4().hex[:12]}",
-        "user_id": user["user_id"], "item": "verify", "diamond_cost": VERIFY_COST
-    }).execute()
+    sb.table("diamond_purchases").insert({"purchase_id": f"pur_{uuid.uuid4().hex[:12]}", "user_id": user["user_id"], "item": "verify", "diamond_cost": VERIFY_COST}).execute()
     return {"ok": True, "verified": True, "diamonds": new_diamonds}
 
 @api_router.post("/purchase/premium")
 def purchase_premium(tier: str = "gold", user: dict = Depends(get_current_user)):
+    if is_premium(user):
+        raise HTTPException(400, "You already have an active premium subscription. Please wait for it to expire.")
     if tier not in ["gold", "premium"]:
         raise HTTPException(400, "Invalid tier")
     cost = GOLD_COST if tier == "gold" else PREMIUM_COST
@@ -326,51 +344,34 @@ def purchase_premium(tier: str = "gold", user: dict = Depends(get_current_user))
     if user.get("diamonds", 0) < cost: raise HTTPException(402, "Not enough diamonds")
     new_diamonds = user["diamonds"] - cost
     expires = datetime.now(timezone.utc) + timedelta(days=days)
-    sb.table("users").update({
-        "diamonds": new_diamonds,
-        "premium_tier": tier,
-        "premium_expires_at": expires.isoformat()
-    }).eq("user_id", user["user_id"]).execute()
-    sb.table("diamond_purchases").insert({
-        "purchase_id": f"pur_{uuid.uuid4().hex[:12]}",
-        "user_id": user["user_id"], "item": f"{tier}_premium", "diamond_cost": cost
-    }).execute()
+    sb.table("users").update({"diamonds": new_diamonds, "premium_tier": tier, "premium_expires_at": expires.isoformat()}).eq("user_id", user["user_id"]).execute()
+    sb.table("diamond_purchases").insert({"purchase_id": f"pur_{uuid.uuid4().hex[:12]}", "user_id": user["user_id"], "item": f"{tier}_premium", "diamond_cost": cost}).execute()
     return {"ok": True, "premium_tier": tier, "diamonds": new_diamonds, "expires_at": expires.isoformat()}
 
-
+@api_router.put("/premium/auto-renew")
+def toggle_auto_renew(user: dict = Depends(get_current_user)):
+    current = user.get("auto_renew", False)
+    new_val = not current
+    sb.table("users").update({"auto_renew": new_val}).eq("user_id", user["user_id"]).execute()
+    return {"ok": True, "auto_renew": new_val}
 
 # ---------- Earn tokens (balloon game) ----------
 @api_router.post("/earn-tokens")
 def earn_tokens(user: dict = Depends(get_current_user)):
-    # Premium users don't need tokens
     if is_premium(user):
         raise HTTPException(400, "Premium members don't earn tokens")
-
-    # Cooldown: once per minute (adjust as needed)
     last_earn = user.get("last_token_earned")
     if last_earn:
         last = _parse_dt(last_earn)
         if datetime.now(timezone.utc) - last < timedelta(minutes=1):
             raise HTTPException(400, "You can earn tokens again in a minute")
-
-    # Award 10 tokens
     new_tokens = user.get("tokens", 0) + 10
-    sb.table("users").update({
-        "tokens": new_tokens,
-        "last_token_earned": datetime.now(timezone.utc).isoformat()
-    }).eq("user_id", user["user_id"]).execute()
-
+    sb.table("users").update({"tokens": new_tokens, "last_token_earned": datetime.now(timezone.utc).isoformat()}).eq("user_id", user["user_id"]).execute()
     return {"ok": True, "tokens_awarded": 10, "total_tokens": new_tokens}
 
-
-
-
-
-
-# ---------- Location API ----------
+# ---------- Location API (unchanged) ----------
 @api_router.post("/location/update")
 async def update_location(payload: LocationUpdatePayload, user: dict = Depends(get_current_user)):
-    # ... (unchanged)
     if not (-90 <= payload.latitude <= 90) or not (-180 <= payload.longitude <= 180):
         raise HTTPException(400, "Invalid coordinates")
     if payload.accuracy and payload.accuracy > 500:
@@ -440,6 +441,7 @@ def get_profile(user: dict) -> dict:
             "gps_latitude": None, "gps_longitude": None, "gps_verified_at": None,
             "location_source": "none",
             "last_active": user.get("last_active"),
+            "verified": False, "premium_tier": None
         }
     lat = profile.get("gps_latitude"); lon = profile.get("gps_longitude")
     country = profile.get("country") if lat is not None else None
@@ -471,11 +473,12 @@ def get_profile(user: dict) -> dict:
         "gps_verified_at": profile.get("gps_verified_at"),
         "location_source": profile.get("location_source", "none"),
         "last_active": user.get("last_active"),
+        "verified": user.get("verified", False),
+        "premium_tier": user.get("premium_tier")
     }
 
 @api_router.post("/profile/setup")
 def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current_user)):
-    # ... (no changes needed)
     existing_profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
     lat = existing_profile.get("gps_latitude") if existing_profile else None
     lon = existing_profile.get("gps_longitude") if existing_profile else None
@@ -520,7 +523,6 @@ def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current
 
 @api_router.put("/profile")
 def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_current_user)):
-    # ... (add visibility/token checks)
     updates = {}
     all_fields = [
         "date_of_birth", "gender", "health_status", "display_name", "bio", "interests", "looking_for",
@@ -532,13 +534,11 @@ def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_curre
     for field in all_fields:
         value = getattr(payload, field, None)
         if value is not None: updates[field] = value
-    # Handle profile_hidden – only allow premium users to hide
     if payload.profile_hidden is not None:
         if not is_premium(user):
-            updates["profile_hidden"] = False  # force visible for free users
+            updates["profile_hidden"] = False
         else:
             updates["profile_hidden"] = payload.profile_hidden
-    # Gallery image limit for free users: max 5
     if payload.gallery_images is not None:
         if not is_premium(user) and len(payload.gallery_images) > 5:
             raise HTTPException(400, "Free users can only upload up to 5 images")
@@ -584,27 +584,33 @@ def get_discover_profiles(user: dict = Depends(get_current_user)):
     query = query.not_.is_("gps_latitude", None)
     for mid in matched_ids: query = query.neq("user_id", mid)
     profiles = (query.limit(200).execute()).data or []
+    if not profiles: return []
+
+    # Fetch user statuses (verified, premium_tier) in one batch
+    user_ids = [p["user_id"] for p in profiles]
+    users_data = sb.table("users").select("user_id,verified,premium_tier").in_("user_id", user_ids).execute().data or []
+    user_status = {u["user_id"]: u for u in users_data}
+
     filtered = []
     for p in profiles:
         if p.get("profile_hidden"): continue
-        # ... age/gender filters same as before
+        # age, gender, distance filters...
         p_lat = p.get("gps_latitude"); p_lon = p.get("gps_longitude")
         distance = None
         if p_lat is not None and p_lon is not None:
             distance = haversine(my_lat, my_lon, p_lat, p_lon)
             if pref_max_distance and distance > pref_max_distance: continue
         p["distance_km"] = round(distance, 1) if distance is not None else None
-        # Limit gallery images for free viewers
-        if not is_premium(user):
-            gallery = p.get("gallery_images") or []
-            p["gallery_images"] = gallery[:1]  # only first gallery image (main profile still shown separately)
+        # Attach user status
+        status = user_status.get(p["user_id"], {})
+        p["verified"] = status.get("verified", False)
+        p["premium_tier"] = status.get("premium_tier")
         filtered.append(p)
     random.shuffle(filtered)
     return filtered[:50]
 
 @api_router.post("/discover/swipe")
 def swipe_profile(payload: SwipePayload, user: dict = Depends(get_current_user)):
-    # Charge token for free users
     if not is_premium(user):
         if user.get("tokens", 0) < 1:
             raise HTTPException(402, "Not enough tokens")
@@ -683,9 +689,7 @@ def get_match_messages(match_id: str, user: dict = Depends(get_current_user)):
 def send_match_message(match_id: str, payload: MatchMessagePayload, user: dict = Depends(get_current_user)):
     if contains_profanity(payload.content):
         raise HTTPException(400, "Message contains inappropriate language")
-    # Token charge for free users after 2 messages
     if not is_premium(user):
-        # count messages sent by this user in this match
         count_res = sb.table("match_messages").select("message_id", count="exact").eq("match_id", match_id).eq("sender_id", user["user_id"]).execute()
         msg_count = count_res.count if hasattr(count_res, 'count') else 0
         if msg_count >= 2:
@@ -693,7 +697,6 @@ def send_match_message(match_id: str, payload: MatchMessagePayload, user: dict =
                 raise HTTPException(402, "Not enough tokens")
             sb.table("users").update({"tokens": user["tokens"] - 1}).eq("user_id", user["user_id"]).execute()
             user["tokens"] -= 1
-
     match = _maybe(sb.table("profile_matches").select("*").eq("match_id", match_id).maybe_single().execute())
     if not match: raise HTTPException(404)
     if user["user_id"] not in [match["user1_id"], match["user2_id"]]: raise HTTPException(403)
@@ -818,112 +821,7 @@ def block_user(payload: BlockPayload, user: dict = Depends(get_current_user)):
     sb.table("profile_matches").delete().or_(f"and(user1_id.eq.{user['user_id']},user2_id.eq.{payload.blocked_user_id}),and(user1_id.eq.{payload.blocked_user_id},user2_id.eq.{user['user_id']})").execute()
     return {"ok": True}
 
-
-
-
-
-# ---------- Flexer Board ----------
-@api_router.post("/flexer/join")
-def flexer_join(amount: int = 6, user: dict = Depends(get_current_user)):
-    if amount < 6:
-        raise HTTPException(400, "Minimum 6 diamonds required to join the Flexer Board")
-    if user.get("diamonds", 0) < amount:
-        raise HTTPException(402, "Not enough diamonds")
-
-    # Check if user already has an active card
-    now = datetime.now(timezone.utc)
-    existing = _maybe(sb.table("flexer_cards").select("*").eq("user_id", user["user_id"]).gt("expires_at", now.isoformat()).maybe_single().execute())
-    
-    new_diamonds = user["diamonds"] - amount
-    if existing:
-        # Renew existing card
-        new_total = existing["diamonds_committed"] + amount
-        new_expiry = max(_parse_dt(existing["expires_at"]), now) + timedelta(days=30)
-        sb.table("flexer_cards").update({
-            "diamonds_committed": new_total,
-            "expires_at": new_expiry.isoformat(),
-            "last_renewed_at": now.isoformat()
-        }).eq("card_id", existing["card_id"]).execute()
-    else:
-        # Create new card
-        card_id = f"flex_{uuid.uuid4().hex[:12]}"
-        expires = now + timedelta(days=30)
-        sb.table("flexer_cards").insert({
-            "card_id": card_id,
-            "user_id": user["user_id"],
-            "diamonds_committed": amount,
-            "created_at": now.isoformat(),
-            "expires_at": expires.isoformat(),
-            "last_renewed_at": now.isoformat()
-        }).execute()
-
-    sb.table("users").update({"diamonds": new_diamonds}).eq("user_id", user["user_id"]).execute()
-    return {"ok": True, "diamonds_spent": amount, "diamonds_remaining": new_diamonds}
-
-@api_router.post("/flexer/increment")
-def flexer_increment(amount: int, user: dict = Depends(get_current_user)):
-    if amount < 1:
-        raise HTTPException(400, "Must add at least 1 diamond")
-    if user.get("diamonds", 0) < amount:
-        raise HTTPException(402, "Not enough diamonds")
-
-    existing = _maybe(sb.table("flexer_cards").select("*").eq("user_id", user["user_id"]).gt("expires_at", datetime.now(timezone.utc).isoformat()).maybe_single().execute())
-    if not existing:
-        raise HTTPException(400, "You need an active Flexer card first")
-
-    # Check card not expired (12 months max from creation)
-    card_age = datetime.now(timezone.utc) - _parse_dt(existing["created_at"])
-    if card_age > timedelta(days=365):
-        raise HTTPException(400, "Card has exceeded 12‑month lifetime. Create a new one.")
-
-    new_total = existing["diamonds_committed"] + amount
-    new_diamonds = user["diamonds"] - amount
-    sb.table("flexer_cards").update({"diamonds_committed": new_total}).eq("card_id", existing["card_id"]).execute()
-    sb.table("users").update({"diamonds": new_diamonds}).eq("user_id", user["user_id"]).execute()
-    return {"ok": True, "total_diamonds": new_total, "diamonds_remaining": new_diamonds}
-
-@api_router.get("/flexer/board")
-def flexer_board(user: dict = Depends(get_current_user)):
-    now = datetime.now(timezone.utc).isoformat()
-    cards = sb.table("flexer_cards").select("*").gt("expires_at", now).order("diamonds_committed", desc=True).limit(100).execute().data or []
-    
-    result = []
-    for card in cards:
-        profile = _maybe(sb.table("user_profiles").select("display_name,profile_image,date_of_birth,country,city,health_status").eq("user_id", card["user_id"]).maybe_single().execute())
-        if profile:
-            age = None
-            if profile.get("date_of_birth"):
-                try:
-                    dob = datetime.fromisoformat(str(profile["date_of_birth"])).date()
-                    today = datetime.now(timezone.utc).date()
-                    age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
-                except: pass
-            result.append({
-                "card_id": card["card_id"],
-                "user_id": card["user_id"],
-                "display_name": profile.get("display_name", "Someone"),
-                "profile_image": profile.get("profile_image", ""),
-                "age": age,
-                "country": profile.get("country", ""),
-                "city": profile.get("city", ""),
-                "health_status": profile.get("health_status"),
-                "diamonds_committed": card["diamonds_committed"],
-                "expires_at": card["expires_at"],
-            })
-    return result
-
-
-
-
-
-
-
-
-
-
-
-
-# ---------- Stories ----------
+# ---------- Stories (unchanged) ----------
 @api_router.post("/stories")
 def create_story(payload: CreateStoryPayload, user: dict = Depends(get_current_user)):
     if not user.get("verified"):
@@ -939,8 +837,6 @@ def create_story(payload: CreateStoryPayload, user: dict = Depends(get_current_u
              "created_at": datetime.now(timezone.utc).isoformat()}
     sb.table("stories").insert(story).execute()
     return {"ok": True, "story": story}
-
-# (rest of stories endpoints unchanged)
 
 @api_router.get("/stories")
 def get_stories(category: Optional[str] = None, user: dict = Depends(get_current_user)):
@@ -997,8 +893,6 @@ def create_comment(story_id: str, payload: CreateCommentPayload, user: dict = De
         if pc: sb.table("story_comments").update({"reply_count": pc.get("reply_count",0)+1}).eq("comment_id", payload.parent_id).execute()
     return {"ok": True, "comment": comment}
 
-# ... (edit/delete stories/comments, same as before)
-
 @api_router.put("/stories/{story_id}")
 def edit_story(story_id: str, payload: CreateStoryPayload, user: dict = Depends(get_current_user)):
     story = _maybe(sb.table("stories").select("*").eq("story_id", story_id).maybe_single().execute())
@@ -1031,6 +925,85 @@ def build_comment_tree(comments):
         if c.get("parent_id") and c["parent_id"] in cmap: cmap[c["parent_id"]]["replies"].append(node)
         else: roots.append(node)
     return roots
+
+# ---------- Flexer Board ----------
+@api_router.post("/flexer/join")
+def flexer_join(amount: int = 6, user: dict = Depends(get_current_user)):
+    if amount < 6:
+        raise HTTPException(400, "Minimum 6 diamonds required to join the Flexer Board")
+    if user.get("diamonds", 0) < amount:
+        raise HTTPException(402, "Not enough diamonds")
+    now = datetime.now(timezone.utc)
+    existing = _maybe(sb.table("flexer_cards").select("*").eq("user_id", user["user_id"]).gt("expires_at", now.isoformat()).maybe_single().execute())
+    new_diamonds = user["diamonds"] - amount
+    if existing:
+        new_total = existing["diamonds_committed"] + amount
+        new_expiry = max(_parse_dt(existing["expires_at"]), now) + timedelta(days=30)
+        sb.table("flexer_cards").update({
+            "diamonds_committed": new_total,
+            "expires_at": new_expiry.isoformat(),
+            "last_renewed_at": now.isoformat()
+        }).eq("card_id", existing["card_id"]).execute()
+    else:
+        card_id = f"flex_{uuid.uuid4().hex[:12]}"
+        expires = now + timedelta(days=30)
+        sb.table("flexer_cards").insert({
+            "card_id": card_id,
+            "user_id": user["user_id"],
+            "diamonds_committed": amount,
+            "created_at": now.isoformat(),
+            "expires_at": expires.isoformat(),
+            "last_renewed_at": now.isoformat()
+        }).execute()
+    sb.table("users").update({"diamonds": new_diamonds}).eq("user_id", user["user_id"]).execute()
+    return {"ok": True, "diamonds_spent": amount, "diamonds_remaining": new_diamonds}
+
+@api_router.post("/flexer/increment")
+def flexer_increment(amount: int, user: dict = Depends(get_current_user)):
+    if amount < 1:
+        raise HTTPException(400, "Must add at least 1 diamond")
+    if user.get("diamonds", 0) < amount:
+        raise HTTPException(402, "Not enough diamonds")
+    existing = _maybe(sb.table("flexer_cards").select("*").eq("user_id", user["user_id"]).gt("expires_at", datetime.now(timezone.utc).isoformat()).maybe_single().execute())
+    if not existing:
+        raise HTTPException(400, "You need an active Flexer card first")
+    card_age = datetime.now(timezone.utc) - _parse_dt(existing["created_at"])
+    if card_age > timedelta(days=365):
+        raise HTTPException(400, "Card has exceeded 12‑month lifetime. Create a new one.")
+    new_total = existing["diamonds_committed"] + amount
+    new_diamonds = user["diamonds"] - amount
+    sb.table("flexer_cards").update({"diamonds_committed": new_total}).eq("card_id", existing["card_id"]).execute()
+    sb.table("users").update({"diamonds": new_diamonds}).eq("user_id", user["user_id"]).execute()
+    return {"ok": True, "total_diamonds": new_total, "diamonds_remaining": new_diamonds}
+
+@api_router.get("/flexer/board")
+def flexer_board(user: dict = Depends(get_current_user)):
+    now = datetime.now(timezone.utc).isoformat()
+    cards = sb.table("flexer_cards").select("*").gt("expires_at", now).order("diamonds_committed", desc=True).limit(100).execute().data or []
+    result = []
+    for card in cards:
+        profile = _maybe(sb.table("user_profiles").select("display_name,profile_image,date_of_birth,country,city,health_status").eq("user_id", card["user_id"]).maybe_single().execute())
+        if profile:
+            age = None
+            if profile.get("date_of_birth"):
+                try:
+                    dob = datetime.fromisoformat(str(profile["date_of_birth"])).date()
+                    today = datetime.now(timezone.utc).date()
+                    age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+                except: pass
+            result.append({
+                "card_id": card["card_id"],
+                "user_id": card["user_id"],
+                "display_name": profile.get("display_name", "Someone"),
+                "profile_image": profile.get("profile_image", ""),
+                "age": age,
+                "country": profile.get("country", ""),
+                "city": profile.get("city", ""),
+                "health_status": profile.get("health_status"),
+                "diamonds_committed": card["diamonds_committed"],
+                "expires_at": card["expires_at"],
+            })
+    return result
 
 # ---------- Countries/Cities ----------
 @api_router.get("/location/countries")
