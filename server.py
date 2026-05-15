@@ -3,10 +3,10 @@ from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
-import os, logging, uuid, random, math, httpx, io, base64
+import os, logging, uuid, random, math, httpx, io, base64, time
 from pathlib import Path
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Dict
 from datetime import datetime, timezone, timedelta
 from PIL import Image
 import httpx as httpx_lib
@@ -36,6 +36,21 @@ app.add_middleware(
 
 api_router = APIRouter(prefix="/api")
 
+# ---------- Simple in‑memory rate limiter (no extra deps) ----------
+RATE_LIMIT_WINDOW = 60  # seconds
+RATE_LIMIT_MAX = 10     # requests per window
+rate_limit_store: Dict[str, list] = {}  # key -> list of timestamps
+
+def check_rate_limit(key: str, max_req: int = RATE_LIMIT_MAX, window: int = RATE_LIMIT_WINDOW):
+    now = time.time()
+    timestamps = rate_limit_store.get(key, [])
+    # remove old entries
+    timestamps = [t for t in timestamps if now - t < window]
+    if len(timestamps) >= max_req:
+        raise HTTPException(429, "Too many requests. Please slow down.")
+    timestamps.append(now)
+    rate_limit_store[key] = timestamps
+
 # ---------- Constants ----------
 EARTH_RADIUS_KM = 6371
 MAX_GPS_AGE_HOURS = 24
@@ -45,6 +60,7 @@ GOLD_COST = 39
 GOLD_DAYS = 30
 PREMIUM_COST = 199
 PREMIUM_DAYS = 180
+MAX_IMAGE_BASE64_SIZE = 5 * 1024 * 1024  # 5 MB
 
 PROFANITY_LIST = {"fuck","shit","bitch","asshole","bastard","dick","pussy","cunt","whore"}
 ETHNICITY_LIST = [
@@ -109,6 +125,9 @@ async def get_location_from_ip(ip: str) -> dict:
 
 # ---------- Image Helpers (WebP) ----------
 def compress_image(base64_str: str, max_size_kb: int = 300) -> bytes:
+    # Size check before decoding
+    if len(base64_str) > MAX_IMAGE_BASE64_SIZE:
+        raise HTTPException(400, "Image too large (max 5 MB)")
     if "," in base64_str: base64_str = base64_str.split(",", 1)[1]
     img_data = base64.b64decode(base64_str)
     img = Image.open(io.BytesIO(img_data))
@@ -132,10 +151,15 @@ def upload_image_to_supabase(file_bytes: bytes, user_id: str, filename: str) -> 
 def process_image_field(image_value: str, user_id: str, filename_prefix: str) -> str:
     if not image_value: return image_value
     if image_value.startswith("data:image") or (len(image_value) > 1000 and "base64" in image_value):
+        # Validate length before processing
+        if len(image_value) > MAX_IMAGE_BASE64_SIZE:
+            raise HTTPException(400, "Image too large (max 5 MB)")
         try:
             compressed = compress_image(image_value)
             filename = f"{filename_prefix}_{uuid.uuid4().hex[:8]}.jpg"
             return upload_image_to_supabase(compressed, user_id, filename)
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Image compression/upload failed: {e}")
             return image_value
@@ -285,6 +309,7 @@ def api_root():
 
 @api_router.post("/auth/google")
 def auth_google(payload: GoogleAuthPayload, request: Request, response: Response):
+    check_rate_limit(f"auth_{request.client.host}", max_req=5)
     email, name, picture = payload.email, payload.name, payload.picture
     session_token = f"session_{uuid.uuid4().hex[:32]}"
     existing = _maybe(sb.table("users").select("*").eq("email", email).eq("deleted", False).maybe_single().execute())
@@ -410,8 +435,8 @@ def toggle_auto_renew(user: dict = Depends(get_current_user)):
     sb.table("users").update({"auto_renew": new_val}).eq("user_id", user["user_id"]).execute()
     return {"ok": True, "auto_renew": new_val}
 
-# ---------- PayPal Diamond Purchase (sandbox) ----------
-PAYPAL_API_BASE = "https://api-m.paypal.com"  # sandbox for testing
+# ---------- PayPal Diamond Purchase ----------
+PAYPAL_API_BASE = "https://api-m.paypal.com"
 
 @api_router.post("/diamonds/create-order")
 async def create_diamond_order(
@@ -419,10 +444,9 @@ async def create_diamond_order(
     request: Request,
     user: dict = Depends(get_current_user)
 ):
-
     packages = {
-        "52": {"diamonds": 52, "amount": 3.00, "label": "$3"},
-        "120": {"diamonds": 120, "amount": 7.00, "label": "$7"},
+        "52":  {"diamonds": 52,  "amount": 3.00,  "label": "$3"},
+        "120": {"diamonds": 120, "amount": 7.00,  "label": "$7"},
         "310": {"diamonds": 310, "amount": 16.00, "label": "$16"},
         "770": {"diamonds": 770, "amount": 32.00, "label": "$32"},
     }
@@ -430,8 +454,6 @@ async def create_diamond_order(
         raise HTTPException(400, "Invalid package")
 
     pkg = packages[package_id]
-
-    # Read credentials from environment variables (set these in Render)
     PAYPAL_CLIENT_ID = os.environ.get("PAYPAL_CLIENT_ID")
     PAYPAL_CLIENT_SECRET = os.environ.get("PAYPAL_CLIENT_SECRET")
     if not PAYPAL_CLIENT_ID or not PAYPAL_CLIENT_SECRET:
@@ -531,8 +553,7 @@ async def capture_diamond_order(
         "item": f"{diamonds}_diamonds_paypal",
         "diamond_cost": 0,
         "purchased_at": datetime.now(timezone.utc).isoformat(),
-    }).execute() 
-    
+    }).execute()
 
     return {"ok": True, "diamonds": new_diamonds}
 
@@ -782,7 +803,7 @@ def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_curre
 def get_my_profile(user: dict = Depends(get_current_user)):
     return get_profile(user)
 
-# ---------- Discovery (token per profile) ----------
+# ---------- Discovery (optimised – DB‑level filters + proper pagination) ----------
 @api_router.get("/discover/profiles")
 def get_discover_profiles(
     user: dict = Depends(get_current_user),
@@ -810,41 +831,62 @@ def get_discover_profiles(
     pref_max_distance = max_distance if max_distance is not None else viewer_profile.get("pref_max_distance", 50)
     pref_sexual_orientation = sexual_orientation if sexual_orientation is not None else viewer_profile.get("pref_sexual_orientation", "")
 
+    # Calculate age range dates
     today = datetime.now(timezone.utc).date()
+    min_birth_date = today.replace(year=today.year - pref_max_age)
+    max_birth_date = today.replace(year=today.year - pref_min_age)
+
     matches = sb.table("profile_matches").select("*").or_(f"user1_id.eq.{user['user_id']},user2_id.eq.{user['user_id']}").execute()
     matched_ids = set()
     for m in (matches.data or []):
         partner = m["user2_id"] if m["user1_id"] == user["user_id"] else m["user1_id"]
         matched_ids.add(partner)
 
-    query = sb.table("user_profiles").select("*").neq("user_id", user["user_id"]).eq("onboarding_complete", True)
-    query = query.not_.is_("gps_latitude", None)
+    query = sb.table("user_profiles").select("*", count="exact") \
+        .neq("user_id", user["user_id"]) \
+        .eq("onboarding_complete", True) \
+        .not_.is_("gps_latitude", None) \
+        .eq("profile_hidden", False)
+
+    if not user.get("verified"):
+        query = query.or_("visible_to.eq.all,visible_to.is.null")
+
+    if pref_gender:
+        query = query.eq("gender", pref_gender)
+    if pref_health:
+        query = query.eq("health_status", pref_health)
+    if pref_country:
+        query = query.eq("country", pref_country)
+    if pref_sexual_orientation:
+        query = query.eq("sexual_orientation", pref_sexual_orientation)
+    if pref_min_age and pref_max_age:
+        query = query.gte("date_of_birth", min_birth_date.isoformat()) \
+                     .lte("date_of_birth", max_birth_date.isoformat())
+
     for mid in matched_ids:
         query = query.neq("user_id", mid)
 
-    profiles = (query.limit(1000).execute()).data or []
+    # Pagination
+    if page is not None and limit is not None:
+        start = (page - 1) * limit
+        end = start + limit - 1
+        query = query.range(start, end)
+    else:
+        query = query.limit(50)
+
+    profiles = query.execute().data or []
     if not profiles:
         return []
 
+    # Batch fetch user statuses
     user_ids = [p["user_id"] for p in profiles]
     users_data = sb.table("users").select("user_id,verified,premium_tier").in_("user_id", user_ids).execute().data or []
     user_status = {u["user_id"]: u for u in users_data}
 
+    # Filter by distance (must do in Python because it's a calculation)
     filtered = []
     for p in profiles:
         if p.get("profile_hidden"): continue
-        if p.get("visible_to") == "verified_only" and not user.get("verified"):
-            continue
-        if p.get("date_of_birth"):
-            try:
-                dob = datetime.fromisoformat(str(p["date_of_birth"])).date()
-                age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
-                if age < pref_min_age or age > pref_max_age: continue
-            except: pass
-        if pref_gender and p.get("gender") != pref_gender: continue
-        if pref_health and p.get("health_status") != pref_health: continue
-        if pref_country and p.get("country") != pref_country: continue
-        if pref_sexual_orientation and p.get("sexual_orientation") != pref_sexual_orientation: continue
         p_lat = p.get("gps_latitude"); p_lon = p.get("gps_longitude")
         distance = None
         if p_lat is not None and p_lon is not None:
@@ -856,19 +898,10 @@ def get_discover_profiles(
         p["premium_tier"] = status.get("premium_tier")
         filtered.append(p)
 
-    random.shuffle(filtered)
-
-    if page is not None and limit is not None:
-        start = (page - 1) * limit
-        end = start + limit
-        result = filtered[start:end]
-    else:
-        result = filtered[:50]
-
     if not is_premium(user):
-        require_token(user, len(result))
+        require_token(user, len(filtered))
 
-    return result
+    return filtered
 
 @api_router.post("/discover/swipe")
 def swipe_profile(payload: SwipePayload, user: dict = Depends(get_current_user)):
