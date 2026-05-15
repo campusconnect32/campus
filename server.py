@@ -327,7 +327,7 @@ def auth_google(payload: GoogleAuthPayload, request: Request, response: Response
             sb.table("users").insert({
                 "user_id": user_id, "email": email, "name": name, "picture": picture,
                 "created_at": now_iso, "last_active": now_iso,
-                "tokens": 15, "diamonds": 5, "verified": False
+                "tokens": 50, "diamonds": 5, "verified": False
             }).execute()
     expires_at = datetime.now(timezone.utc) + timedelta(days=7)
     sb.table("user_sessions").upsert({"session_token": session_token, "user_id": user_id, "expires_at": expires_at.isoformat(), "created_at": now_iso}).execute()
