@@ -1488,7 +1488,7 @@ def admin_image_queue(user: dict = Depends(get_current_user)):
         raise HTTPException(403, "Admin access required")
     # Fetch profiles with images, ordered by updated_at desc
     profiles = sb.table("user_profiles").select("*").not_.is_("profile_image", None).order("updated_at", desc=True).limit(50).execute().data or []
-    users = sb.table("users").select("user_id,display_name,verified,premium_tier").execute().data or []
+    users = sb.table("users").select("user_id,verified,premium_tier").execute().data or []
     user_map = {u["user_id"]: u for u in users}
     result = []
     for p in profiles:
