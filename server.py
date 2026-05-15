@@ -1470,7 +1470,8 @@ def admin_announce(payload: dict, user: dict = Depends(get_current_user)):
     errors = 0
     for u in users:
         try:
-            notify_user(u["user_id"], "announcement", message, "system")
+            # Use the admin's own user_id as the sender, not "system"
+            notify_user(u["user_id"], "announcement", message, user["user_id"])
             sent_count += 1
         except Exception as e:
             logger.error(f"Failed to notify {u['user_id']}: {e}")
