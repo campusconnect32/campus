@@ -315,8 +315,11 @@ def auth_google(payload: GoogleAuthPayload, request: Request, response: Response
         user_id = existing["user_id"]
         sb.table("users").update({"name": name, "picture": picture, "last_active": now_iso, "deleted": False}).eq("user_id", user_id).execute()
     else:
+        # Check if there's a deleted account with this email
         deleted_user = _maybe(sb.table("users").select("*").eq("email", email).eq("deleted", True).maybe_single().execute())
         if deleted_user:
+            if deleted_user.get("banned"):
+                raise HTTPException(403, "Your account has been banned.")
             user_id = deleted_user["user_id"]
             sb.table("users").update({"name": name, "picture": picture, "last_active": now_iso, "deleted": False}).eq("user_id", user_id).execute()
         else:
