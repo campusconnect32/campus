@@ -420,10 +420,10 @@ async def create_diamond_order(
     user: dict = Depends(get_current_user)
 ):
     packages = {
-        "60": {"diamonds": 60, "amount": 50.00, "zar": "R50"},
-        "120": {"diamonds": 120, "amount": 100.00, "zar": "R100"},
-        "300": {"diamonds": 300, "amount": 250.00, "zar": "R250"},
-        "700": {"diamonds": 700, "amount": 500.00, "zar": "R500"},
+        "52": {"diamonds": 52, "amount": 3.00, "label": "$3"},
+        "120": {"diamonds": 120, "amount": 7.00, "label": "$7"},
+        "310": {"diamonds": 300, "amount": 16.00, "label": "$16"},
+        "770": {"diamonds": 700, "amount": 32.00, "label": "$32"},
     }
     if package_id not in packages:
         raise HTTPException(400, "Invalid package")
@@ -454,7 +454,7 @@ async def create_diamond_order(
                 "currency_code": "USD",
                 "value": str(pkg["amount"]),
             },
-            "description": f"{pkg['diamonds']} Diamonds for {pkg['zar']}",
+            "description": f"{pkg['diamonds']} Diamonds for {pkg['label']}",
             "custom_id": user["user_id"] + ":" + package_id,
         }],
         "application_context": {
