@@ -637,6 +637,12 @@ def get_location_status(user: dict = Depends(get_current_user)):
 
 # ---------- Profile ----------
 def get_profile(user: dict) -> dict:
+    # If we only have a user_id, fetch the full user row first
+    if "email" not in user or "last_active" not in user:
+        full_user = _maybe(sb.table("users").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
+        if full_user:
+            user = full_user
+
     profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
     if not profile:
         return {
@@ -695,10 +701,12 @@ def get_profile(user: dict) -> dict:
         "gps_latitude": lat, "gps_longitude": lon,
         "gps_verified_at": profile.get("gps_verified_at"),
         "location_source": profile.get("location_source", "none"),
-        "last_active": user.get("last_active"),
+        "last_active": user.get("last_active"),        # now properly fetched
         "verified": user.get("verified", False),
         "premium_tier": user.get("premium_tier")
     }
+
+
 
 @api_router.post("/profile/setup")
 def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current_user)):
