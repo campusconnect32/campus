@@ -1331,6 +1331,179 @@ def get_cities(country:str):
     fallback = {"South Africa":["Johannesburg","Cape Town","Durban"],"United States":["New York","Los Angeles","Chicago"]}
     return [{"name":c} for c in fallback.get(country,[])]
 
+
+# ---------- Admin ----------
+@api_router.get("/admin/check")
+def admin_check(user: dict = Depends(get_current_user)):
+    return {"is_admin": user.get("is_admin", False)}
+
+# ---------- Reports ----------
+@api_router.get("/admin/reports")
+def admin_get_reports(user: dict = Depends(get_current_user)):
+    if not user.get("is_admin"):
+        raise HTTPException(403, "Admin access required")
+    reports = sb.table("user_reports").select("*").order("created_at", desc=True).execute().data or []
+    result = []
+    for r in reports:
+        reporter = _maybe(sb.table("users").select("email,name").eq("user_id", r["reporter_id"]).maybe_single().execute())
+        reported = _maybe(sb.table("users").select("email,name").eq("user_id", r["reported_user_id"]).maybe_single().execute())
+        result.append({
+            "report_id": r["report_id"],
+            "reporter_name": reporter.get("name") or reporter.get("email","Unknown") if reporter else "Unknown",
+            "reporter_email": reporter.get("email","Unknown") if reporter else "Unknown",
+            "reported_name": reported.get("name") or reported.get("email","Unknown") if reported else "Unknown",
+            "reported_email": reported.get("email","Unknown") if reported else "Unknown",
+            "reported_user_id": r["reported_user_id"],
+            "reason": r.get("reason",""),
+            "created_at": r["created_at"],
+        })
+    return result
+
+@api_router.post("/admin/reports/{report_id}/resolve")
+def admin_resolve_report(report_id: str, user: dict = Depends(get_current_user)):
+    if not user.get("is_admin"):
+        raise HTTPException(403, "Admin access required")
+    sb.table("user_reports").delete().eq("report_id", report_id).execute()
+    return {"ok": True}
+
+# ---------- Ban / Unban ----------
+@api_router.post("/admin/ban")
+def admin_ban_user(payload: dict, user: dict = Depends(get_current_user)):
+    if not user.get("is_admin"):
+        raise HTTPException(403, "Admin access required")
+    target_id = payload.get("user_id")
+    reason = payload.get("reason", "")
+    duration_days = payload.get("duration_days")  # None = permanent
+
+    if not target_id:
+        raise HTTPException(400, "Missing user_id")
+
+    update_data = {"deleted": True, "banned": True, "banned_reason": reason}
+    if duration_days:
+        update_data["banned_until"] = (datetime.now(timezone.utc) + timedelta(days=duration_days)).isoformat()
+    else:
+        update_data["banned_until"] = None
+
+    sb.table("users").update(update_data).eq("user_id", target_id).execute()
+    sb.table("user_sessions").delete().eq("user_id", target_id).execute()
+    return {"ok": True}
+
+@api_router.post("/admin/unban")
+def admin_unban_user(payload: dict, user: dict = Depends(get_current_user)):
+    if not user.get("is_admin"):
+        raise HTTPException(403, "Admin access required")
+    target_id = payload.get("user_id")
+    if not target_id:
+        raise HTTPException(400, "Missing user_id")
+    sb.table("users").update({"deleted": False, "banned": False, "banned_reason": None, "banned_until": None}).eq("user_id", target_id).execute()
+    return {"ok": True}
+
+# ---------- Stories Moderation ----------
+@api_router.get("/admin/stories")
+def admin_get_stories(user: dict = Depends(get_current_user)):
+    if not user.get("is_admin"):
+        raise HTTPException(403, "Admin access required")
+    stories = sb.table("stories").select("*").order("created_at", desc=True).limit(200).execute().data or []
+    return stories
+
+@api_router.delete("/admin/stories/{story_id}")
+def admin_delete_story(story_id: str, user: dict = Depends(get_current_user)):
+    if not user.get("is_admin"):
+        raise HTTPException(403, "Admin access required")
+    sb.table("story_comments").delete().eq("story_id", story_id).execute()
+    sb.table("story_likes").delete().eq("story_id", story_id).execute()
+    sb.table("stories").delete().eq("story_id", story_id).execute()
+    return {"ok": True}
+
+# ---------- User Lookup ----------
+@api_router.get("/admin/users")
+def admin_search_users(query: str, user: dict = Depends(get_current_user)):
+    if not user.get("is_admin"):
+        raise HTTPException(403, "Admin access required")
+    # Search by email or name (using display_name or name)
+    res = sb.table("users").select("user_id,email,name,verified,premium_tier,deleted,banned,tokens,diamonds,last_active,created_at").or_(f"email.ilike.%{query}%,name.ilike.%{query}%").limit(20).execute()
+    users = res.data or []
+    # Also search profiles for display_name
+    profiles = sb.table("user_profiles").select("user_id,display_name").or_(f"display_name.ilike.%{query}%").limit(20).execute().data or []
+    # Merge
+    profile_map = {p["user_id"]: p["display_name"] for p in profiles}
+    result = []
+    for u in users:
+        u["display_name"] = profile_map.get(u["user_id"]) or u.get("name","")
+        result.append(u)
+    return result
+
+# ---------- Stats ----------
+@api_router.get("/admin/stats")
+def admin_stats(user: dict = Depends(get_current_user)):
+    if not user.get("is_admin"):
+        raise HTTPException(403, "Admin access required")
+    total_users = sb.table("users").select("user_id", count="exact").eq("deleted", False).execute().count
+    # New today
+    today = datetime.now(timezone.utc).date()
+    new_today = sb.table("users").select("user_id", count="exact").gte("created_at", today.isoformat()).execute().count
+    # Active (last 24h)
+    active = sb.table("users").select("user_id", count="exact").gte("last_active", (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()).execute().count
+    # Revenue (sum of diamond purchases) – we store amount paid in description but not a numeric column. We'll approximate by counting purchases.
+    purchases = sb.table("diamond_purchases").select("item").execute().data or []
+    # Estimate revenue: each purchase corresponds to a package value. We'll just return purchase count.
+    total_purchases = len(purchases)
+    return {
+        "total_users": total_users,
+        "new_today": new_today,
+        "active_last_24h": active,
+        "diamond_purchases": total_purchases,
+    }
+
+# ---------- Announcement ----------
+@api_router.post("/admin/announce")
+def admin_announce(payload: dict, user: dict = Depends(get_current_user)):
+    if not user.get("is_admin"):
+        raise HTTPException(403, "Admin access required")
+    message = payload.get("message", "")
+    if not message:
+        raise HTTPException(400, "Message required")
+    # Send notification to all users (not really scalable for huge lists, but fine for now)
+    users = sb.table("users").select("user_id").eq("deleted", False).execute().data or []
+    for u in users:
+        notify_user(u["user_id"], "announcement", message, "system")
+    return {"ok": True, "sent_to": len(users)}
+
+# ---------- Manual Verification ----------
+@api_router.post("/admin/verify-user")
+def admin_verify_user(payload: dict, user: dict = Depends(get_current_user)):
+    if not user.get("is_admin"):
+        raise HTTPException(403, "Admin access required")
+    target_id = payload.get("user_id")
+    verified = payload.get("verified", True)
+    if not target_id:
+        raise HTTPException(400, "Missing user_id")
+    sb.table("users").update({"verified": verified}).eq("user_id", target_id).execute()
+    return {"ok": True}
+
+# ---------- Image Queue (recently updated profiles) ----------
+@api_router.get("/admin/image-queue")
+def admin_image_queue(user: dict = Depends(get_current_user)):
+    if not user.get("is_admin"):
+        raise HTTPException(403, "Admin access required")
+    # Fetch profiles with images, ordered by updated_at desc
+    profiles = sb.table("user_profiles").select("*").not_.is_("profile_image", None).order("updated_at", desc=True).limit(50).execute().data or []
+    users = sb.table("users").select("user_id,display_name,verified,premium_tier").execute().data or []
+    user_map = {u["user_id"]: u for u in users}
+    result = []
+    for p in profiles:
+        u = user_map.get(p["user_id"], {})
+        result.append({
+            "user_id": p["user_id"],
+            "display_name": p.get("display_name") or u.get("display_name") or "Anonymous",
+            "profile_image": p.get("profile_image"),
+            "gallery_images": p.get("gallery_images") or [],
+            "updated_at": p.get("updated_at"),
+            "verified": u.get("verified", False),
+        })
+    return result
+
+
 app.include_router(api_router)
 
 if __name__ == "__main__":
