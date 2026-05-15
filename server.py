@@ -422,8 +422,8 @@ async def create_diamond_order(
     packages = {
         "52": {"diamonds": 52, "amount": 3.00, "label": "$3"},
         "120": {"diamonds": 120, "amount": 7.00, "label": "$7"},
-        "310": {"diamonds": 300, "amount": 16.00, "label": "$16"},
-        "770": {"diamonds": 700, "amount": 32.00, "label": "$32"},
+        "310": {"diamonds": 310, "amount": 16.00, "label": "$16"},
+        "770": {"diamonds": 770, "amount": 32.00, "label": "$32"},
     }
     if package_id not in packages:
         raise HTTPException(400, "Invalid package")
