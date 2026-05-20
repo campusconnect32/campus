@@ -10,7 +10,7 @@ from typing import Optional, List, Dict
 from datetime import datetime, timezone, timedelta
 from PIL import Image
 import httpx as httpx_lib
-
+import uuid
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
@@ -1581,11 +1581,19 @@ def report_content(payload: dict, user: dict = Depends(get_current_user)):
     if not reported_user_id or not reason:
         raise HTTPException(400, "Missing reported_user_id or reason")
 
-    # Create the report – only use columns that exist in user_reports
+    # Build a descriptive reason text that includes the context
+    full_reason = reason
+    if image_index is not None:
+        full_reason += f" (image {image_index})"
+    if story_id:
+        full_reason += f" (story {story_id})"
+
+    # Insert with a new UUID for report_id
     sb.table("user_reports").insert({
+        "report_id": str(uuid.uuid4()),          # ← this was missing
         "reporter_id": user["user_id"],
         "reported_user_id": reported_user_id,
-        "reason": f"{reason}" + (f" (image {image_index})" if image_index is not None else "") + (f" (story {story_id})" if story_id else ""),
+        "reason": full_reason,
         "created_at": datetime.utcnow().isoformat()
     }).execute()
 
@@ -1598,7 +1606,6 @@ def report_content(payload: dict, user: dict = Depends(get_current_user)):
     )
 
     return {"ok": True}
-
 # ---------- Admin: get detailed reports ----------
 @api_router.get("/admin/reports-detailed")
 def admin_get_detailed_reports(user: dict = Depends(get_current_user)):
