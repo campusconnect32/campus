@@ -1608,35 +1608,28 @@ def report_content(payload: dict, user: dict = Depends(get_current_user)):
     return {"ok": True}
 
 
-
-
 # ---------- Admin: get detailed reports ----------
 @api_router.get("/admin/reports-detailed")
 def get_detailed_reports(user: dict = Depends(get_current_user)):
     if not user.get("is_admin"):
         raise HTTPException(403, "Admin only")
 
-    # Fetch all reports from the user_reports table
     reports = sb.table("user_reports").select("*").order("created_at", desc=True).execute().data or []
 
     enriched = []
     for r in reports:
         item = dict(r)
-
-        # Parse the reason string to get base reason and context
         reason_full = r.get("reason", "")
         base_reason = reason_full
         image_index = None
         story_id = None
 
-        # Extract image index if present, e.g., "nudity (image 0)"
         if "(image " in reason_full:
             base_reason = reason_full.split(" (image ")[0]
             try:
                 image_index = int(reason_full.split("(image ")[1].split(")")[0])
             except:
                 pass
-        # Extract story id if present, e.g., "racist (story story_abc123)"
         if "(story " in reason_full:
             base_reason = reason_full.split(" (story ")[0]
             story_id_part = reason_full.split("(story ")[1].rstrip(")")
@@ -1645,16 +1638,13 @@ def get_detailed_reports(user: dict = Depends(get_current_user)):
         item["reason_clean"] = base_reason
         item["type"] = "photo" if image_index is not None else ("story" if story_id else "user")
 
-        # Get reporter info
         reporter = sb.table("users").select("email,name").eq("user_id", r["reporter_id"]).maybe_single().execute().data
         item["reporter_name"] = reporter["name"] or reporter["email"] if reporter else "Unknown"
 
-        # Get reported user info
         target = sb.table("users").select("email,name").eq("user_id", r["reported_user_id"]).maybe_single().execute().data
         item["reported_name"] = target["name"] or target["email"] if target else "Unknown"
         item["reported_email"] = target["email"] if target else ""
 
-        # If photo report, fetch the specific image URL
         if item["type"] == "photo" and image_index is not None:
             profile = sb.table("user_profiles").select("profile_image,gallery_images").eq("user_id", r["reported_user_id"]).maybe_single().execute().data
             if profile:
@@ -1665,7 +1655,6 @@ def get_detailed_reports(user: dict = Depends(get_current_user)):
                     if image_index - 1 < len(gallery):
                         item["image_url"] = gallery[image_index - 1]
 
-        # If story report, fetch story content
         if item["type"] == "story" and story_id:
             story = sb.table("stories").select("content").eq("story_id", story_id).maybe_single().execute().data
             if story:
@@ -1675,89 +1664,6 @@ def get_detailed_reports(user: dict = Depends(get_current_user)):
 
     return enriched
 
-
-
-
-
-
-# ---------- Admin: delete reported photo ----------
-@api_router.delete("/admin/reports/{report_id}/delete-photo")
-def admin_delete_reported_photo(report_id: str, user: dict = Depends(get_current_user)):
-    if not user.get("is_admin"):
-        raise HTTPException(403, "Admin access required")
-
-    report = _maybe(sb.table("user_reports").select("*").eq("report_id", report_id).maybe_single().execute())
-    if not report:
-        raise HTTPException(404, "Report not found")
-
-    meta = report.get("metadata") or {}
-    image_index = meta.get("image_index")
-    reported_user_id = report["reported_user_id"]
-
-    if image_index is None:
-        raise HTTPException(400, "Not a photo report")
-
-    # Delete the image
-    profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", reported_user_id).maybe_single().execute())
-    if not profile:
-        raise HTTPException(404, "User profile not found")
-
-    if image_index == 0:
-        # profile image
-        image_url = profile.get("profile_image")
-        if image_url:
-            path = extract_path_from_url(image_url)
-            if path:
-                try:
-                    sb.storage.from_(STORAGE_BUCKET).remove([path])
-                except Exception as e:
-                    logger.warning(f"Could not delete profile image {path}: {e}")
-        sb.table("user_profiles").update({"profile_image": None}).eq("user_id", reported_user_id).execute()
-    else:
-        gallery = profile.get("gallery_images") or []
-        if 0 <= image_index < len(gallery):
-            image_url = gallery[image_index]
-            path = extract_path_from_url(image_url)
-            if path:
-                try:
-                    sb.storage.from_(STORAGE_BUCKET).remove([path])
-                except Exception as e:
-                    logger.warning(f"Could not delete gallery image {path}: {e}")
-            del gallery[image_index]
-            sb.table("user_profiles").update({"gallery_images": gallery}).eq("user_id", reported_user_id).execute()
-
-    # Send warning notification to the owner
-    notify_user(reported_user_id, "warning", f"Your photo was removed for violating our guidelines ({report['reason']}). Repeated violations may lead to account suspension.", user["user_id"])
-
-    # Resolve the report
-    sb.table("user_reports").delete().eq("report_id", report_id).execute()
-    return {"ok": True}
-
-# ---------- Admin: delete reported story ----------
-@api_router.delete("/admin/reports/{report_id}/delete-story")
-def admin_delete_reported_story(report_id: str, user: dict = Depends(get_current_user)):
-    if not user.get("is_admin"):
-        raise HTTPException(403, "Admin access required")
-
-    report = _maybe(sb.table("user_reports").select("*").eq("report_id", report_id).maybe_single().execute())
-    if not report:
-        raise HTTPException(404, "Report not found")
-
-    story_id = (report.get("metadata") or {}).get("story_id")
-    if not story_id:
-        raise HTTPException(400, "Not a story report")
-
-    # Delete the story
-    sb.table("story_comments").delete().eq("story_id", story_id).execute()
-    sb.table("story_likes").delete().eq("story_id", story_id).execute()
-    sb.table("stories").delete().eq("story_id", story_id).execute()
-
-    # Warn the story author
-    notify_user(report["reported_user_id"], "warning", f"Your story was removed for violating our guidelines ({report['reason']}). Repeated violations may lead to account suspension.", user["user_id"])
-
-    # Resolve the report
-    sb.table("user_reports").delete().eq("report_id", report_id).execute()
-    return {"ok": True}
 
 # ---------- Admin: suspend user ----------
 @api_router.post("/admin/suspend")
@@ -1778,12 +1684,10 @@ def admin_delete_reported_photo(report_id: str, user: dict = Depends(get_current
     if not user.get("is_admin"):
         raise HTTPException(403, "Admin only")
 
-    # Fetch the report
     report = sb.table("user_reports").select("*").eq("report_id", report_id).maybe_single().execute().data
     if not report:
         raise HTTPException(404, "Report not found")
 
-    # Extract image index from reason (e.g., "nudity (image 0)")
     reason = report.get("reason", "")
     image_index = None
     if "(image " in reason:
@@ -1792,12 +1696,10 @@ def admin_delete_reported_photo(report_id: str, user: dict = Depends(get_current
         except:
             raise HTTPException(400, "Invalid image index in report")
 
-    # Remove the image from the user's profile
     target_user_id = report["reported_user_id"]
     profile = sb.table("user_profiles").select("profile_image,gallery_images").eq("user_id", target_user_id).maybe_single().execute().data
     if profile:
         if image_index == 0:
-            # Delete profile image
             sb.table("user_profiles").update({"profile_image": None}).eq("user_id", target_user_id).execute()
         else:
             gallery = profile.get("gallery_images") or []
@@ -1805,12 +1707,8 @@ def admin_delete_reported_photo(report_id: str, user: dict = Depends(get_current
                 del gallery[image_index - 1]
                 sb.table("user_profiles").update({"gallery_images": gallery}).eq("user_id", target_user_id).execute()
 
-    # Resolve the report
     sb.table("user_reports").delete().eq("report_id", report_id).execute()
-
-    # Warn the user
     notify_user(target_user_id, "warning", f"Your photo was removed because it was reported as {reason}. Please follow our guidelines.", user["user_id"])
-
     return {"ok": True}
 
 
@@ -1824,7 +1722,6 @@ def admin_delete_reported_story(report_id: str, user: dict = Depends(get_current
     if not report:
         raise HTTPException(404, "Report not found")
 
-    # Extract story_id from reason
     reason = report.get("reason", "")
     story_id = None
     if "(story " in reason:
@@ -1833,80 +1730,8 @@ def admin_delete_reported_story(report_id: str, user: dict = Depends(get_current
     if story_id:
         sb.table("stories").delete().eq("story_id", story_id).execute()
 
-    # Resolve the report
     sb.table("user_reports").delete().eq("report_id", report_id).execute()
-
     notify_user(report["reported_user_id"], "warning", f"Your story was removed because it was reported as {reason}.", user["user_id"])
-
-    return {"ok": True}
-
-
-# ---------- Admin: delete reported photo ----------
-@api_router.delete("/admin/reports/{report_id}/delete-photo")
-def admin_delete_reported_photo(report_id: str, user: dict = Depends(get_current_user)):
-    if not user.get("is_admin"):
-        raise HTTPException(403, "Admin only")
-
-    # Fetch the report
-    report = sb.table("user_reports").select("*").eq("report_id", report_id).maybe_single().execute().data
-    if not report:
-        raise HTTPException(404, "Report not found")
-
-    # Extract image index from reason (e.g., "nudity (image 0)")
-    reason = report.get("reason", "")
-    image_index = None
-    if "(image " in reason:
-        try:
-            image_index = int(reason.split("(image ")[1].split(")")[0])
-        except:
-            raise HTTPException(400, "Invalid image index in report")
-
-    # Remove the image from the user's profile
-    target_user_id = report["reported_user_id"]
-    profile = sb.table("user_profiles").select("profile_image,gallery_images").eq("user_id", target_user_id).maybe_single().execute().data
-    if profile:
-        if image_index == 0:
-            # Delete profile image
-            sb.table("user_profiles").update({"profile_image": None}).eq("user_id", target_user_id).execute()
-        else:
-            gallery = profile.get("gallery_images") or []
-            if image_index - 1 < len(gallery):
-                del gallery[image_index - 1]
-                sb.table("user_profiles").update({"gallery_images": gallery}).eq("user_id", target_user_id).execute()
-
-    # Resolve the report
-    sb.table("user_reports").delete().eq("report_id", report_id).execute()
-
-    # Warn the user
-    notify_user(target_user_id, "warning", f"Your photo was removed because it was reported as {reason}. Please follow our guidelines.", user["user_id"])
-
-    return {"ok": True}
-
-
-# ---------- Admin: delete reported story ----------
-@api_router.delete("/admin/reports/{report_id}/delete-story")
-def admin_delete_reported_story(report_id: str, user: dict = Depends(get_current_user)):
-    if not user.get("is_admin"):
-        raise HTTPException(403, "Admin only")
-
-    report = sb.table("user_reports").select("*").eq("report_id", report_id).maybe_single().execute().data
-    if not report:
-        raise HTTPException(404, "Report not found")
-
-    # Extract story_id from reason (e.g., "racist (story abc123)")
-    reason = report.get("reason", "")
-    story_id = None
-    if "(story " in reason:
-        story_id = reason.split("(story ")[1].rstrip(")")
-
-    if story_id:
-        sb.table("stories").delete().eq("story_id", story_id).execute()
-
-    # Resolve the report
-    sb.table("user_reports").delete().eq("report_id", report_id).execute()
-
-    notify_user(report["reported_user_id"], "warning", f"Your story was removed because it was reported as {reason}.", user["user_id"])
-
     return {"ok": True}
 
 app.include_router(api_router)
