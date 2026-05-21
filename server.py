@@ -1735,6 +1735,15 @@ def admin_delete_reported_story(report_id: str, user: dict = Depends(get_current
     notify_user(report["reported_user_id"], "warning", f"Your story was removed because it was reported as {reason}.", user["user_id"])
     return {"ok": True}
 
+
+
+// lost child
+@api_router.get("/users/{user_id}/profile")
+def get_user_profile(user_id: str):
+    profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user_id).maybe_single().execute())
+    if not profile:
+        raise HTTPException(404, "User not found")
+    return profile
 app.include_router(api_router)
 
 if __name__ == "__main__":
