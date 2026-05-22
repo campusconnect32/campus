@@ -1572,7 +1572,44 @@ def extract_path_from_url(url: str) -> Optional[str]:
 
 
 # ---------- Photo & Story reports ----------
+
 @api_router.post("/report-content")
+def report_content(payload: dict, user: dict = Depends(get_current_user)):
+    reported_user_id = payload.get("reported_user_id")
+    reason = payload.get("reason", "")
+    image_index = payload.get("image_index")
+    story_id = payload.get("story_id")
+
+    if not reported_user_id or not reason:
+        raise HTTPException(400, "Missing reported_user_id or reason")
+
+    full_reason = reason
+    if image_index is not None:
+        full_reason += f" (image {image_index})"
+    if story_id:
+        full_reason += f" (story {story_id})"
+
+    # ---------- THE FIX ----------
+    sb.table("user_reports").insert({
+        "report_id": str(uuid.uuid4()),          # ← this was missing
+        "reporter_id": user["user_id"],
+        "reported_user_id": reported_user_id,
+        "reason": full_reason,
+        "created_at": datetime.utcnow().isoformat()
+    }).execute()
+
+    notify_user(
+        reported_user_id,
+        "warning",
+        f"Your content has been reported for: {reason}. Our team will review it.",
+        user["user_id"]
+    )
+
+    return {"ok": True}
+
+
+
+""" @api_router.post("/report-content")
 def report_content(payload: dict, user: dict = Depends(get_current_user)):
     reported_user_id = payload.get("reported_user_id")
     reason = payload.get("reason", "")
@@ -1606,9 +1643,14 @@ def report_content(payload: dict, user: dict = Depends(get_current_user)):
         user["user_id"]
     )
 
-    return {"ok": True}
+    return {"ok": True} """
 
 
+
+
+
+
+# ---------- Admin: get detailed reports ----------
 # ---------- Admin: get detailed reports ----------
 @api_router.get("/admin/reports-detailed")
 def get_detailed_reports(user: dict = Depends(get_current_user)):
@@ -1639,15 +1681,16 @@ def get_detailed_reports(user: dict = Depends(get_current_user)):
         item["reason_clean"] = base_reason
         item["type"] = "photo" if image_index is not None else ("story" if story_id else "user")
 
-        reporter = sb.table("users").select("email,name").eq("user_id", r["reporter_id"]).maybe_single().execute().data
+        # Safe fetching using _maybe
+        reporter = _maybe(sb.table("users").select("email,name").eq("user_id", r["reporter_id"]).maybe_single().execute())
         item["reporter_name"] = reporter["name"] or reporter["email"] if reporter else "Unknown"
 
-        target = sb.table("users").select("email,name").eq("user_id", r["reported_user_id"]).maybe_single().execute().data
+        target = _maybe(sb.table("users").select("email,name").eq("user_id", r["reported_user_id"]).maybe_single().execute())
         item["reported_name"] = target["name"] or target["email"] if target else "Unknown"
         item["reported_email"] = target["email"] if target else ""
 
         if item["type"] == "photo" and image_index is not None:
-            profile = sb.table("user_profiles").select("profile_image,gallery_images").eq("user_id", r["reported_user_id"]).maybe_single().execute().data
+            profile = _maybe(sb.table("user_profiles").select("profile_image,gallery_images").eq("user_id", r["reported_user_id"]).maybe_single().execute())
             if profile:
                 if image_index == 0:
                     item["image_url"] = profile.get("profile_image")
@@ -1657,14 +1700,13 @@ def get_detailed_reports(user: dict = Depends(get_current_user)):
                         item["image_url"] = gallery[image_index - 1]
 
         if item["type"] == "story" and story_id:
-            story = sb.table("stories").select("content").eq("story_id", story_id).maybe_single().execute().data
+            story = _maybe(sb.table("stories").select("content").eq("story_id", story_id).maybe_single().execute())
             if story:
                 item["story_content"] = story.get("content", "")
 
         enriched.append(item)
 
     return enriched
-
 
 # ---------- Admin: suspend user ----------
 @api_router.post("/admin/suspend")
