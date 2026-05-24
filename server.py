@@ -2512,7 +2512,7 @@ def verify_google_purchase(payload: dict, user: dict = Depends(get_current_user)
         )
         service = build("androidpublisher", "v3", credentials=credentials)
         result = service.purchases().products().get(
-            packageName="date.perfecthorse.haven",
+            packageName="date.perfecthorse.havenpositive",
             productId=product_id,
             token=purchase_token,
         ).execute()
