@@ -428,6 +428,14 @@ def create_identity(payload: CreateIdentityPayload, user: dict = Depends(get_cur
     if user.get("diamonds", 0) < 5:
         raise HTTPException(402, "You need 5 diamonds to create an identity")
 
+    # ---------- UNIQUE TITLE CHECK ----------
+    existing_title = _maybe(
+        sb.table("identities").select("identity_id").ilike("title", payload.title.strip()).maybe_single().execute()
+    )
+    if existing_title:
+        raise HTTPException(400, "An identity with this name already exists")
+    # -----------------------------------------
+
     identity_id = f"id_{uuid.uuid4().hex[:12]}"
     now = datetime.now(timezone.utc).isoformat()
     sb.table("identities").insert({
@@ -1044,14 +1052,20 @@ def get_discover_profiles(
     for mid in matched_ids:
         query = query.neq("user_id", mid)
 
-    # Identity visibility filter
+    # ---------- IDENTITY VISIBILITY FILTER (REFINED) ----------
     identity_vis = viewer_profile.get("visible_to_same_identity", False)
     visible_ids = viewer_profile.get("visible_identity_ids") or []
 
     if identity_vis or visible_ids:
         allowed_user_ids = set()
 
-        if identity_vis:
+        # If specific identities are chosen, use only those
+        if visible_ids:
+            claimed_users = sb.table("user_identity_claims").select("user_id").in_("identity_id", visible_ids).execute().data or []
+            allowed_user_ids.update(cu["user_id"] for cu in claimed_users)
+            allowed_user_ids.add(user["user_id"])
+        else:
+            # Otherwise, use all identities the viewer has claimed
             viewer_claims = sb.table("user_identity_claims").select("identity_id").eq("user_id", user["user_id"]).execute().data or []
             viewer_identity_ids = [c["identity_id"] for c in viewer_claims]
             if viewer_identity_ids:
@@ -1059,16 +1073,12 @@ def get_discover_profiles(
                 allowed_user_ids.update(cu["user_id"] for cu in claimed_users)
             allowed_user_ids.add(user["user_id"])
 
-        if visible_ids:
-            if visible_ids:
-                claimed_users = sb.table("user_identity_claims").select("user_id").in_("identity_id", visible_ids).execute().data or []
-                allowed_user_ids.update(cu["user_id"] for cu in claimed_users)
-                allowed_user_ids.add(user["user_id"])
-
         if allowed_user_ids:
             query = query.in_("user_id", list(allowed_user_ids))
         else:
+            # No matching users – return empty
             query = query.in_("user_id", [user["user_id"]])
+    # ------------------------------------------------------------
 
     if page is not None and limit is not None:
         start = (page - 1) * limit
