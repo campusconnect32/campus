@@ -567,6 +567,27 @@ def identity_leaderboard(user: dict = Depends(get_current_user)):
         result.append(ident)
     return result[:50]  # top 50
 
+
+@api_router.get("/identities/leaderboard")
+def identity_leaderboard(user: dict = Depends(get_current_user)):
+    # Get all identities with claim counts sorted
+    identities = sb.table("identities").select("*").execute().data or []
+    if not identities:
+        return []
+    ids = [i["identity_id"] for i in identities]
+    # Get claim counts
+    claim_counts = sb.table("user_identity_claims").select("identity_id", count="exact").in_("identity_id", ids).execute()
+    counts = {row["identity_id"]: row["count"] for row in claim_counts.data}
+    # Sort by count descending
+    sorted_ids = sorted(ids, key=lambda x: counts.get(x, 0), reverse=True)
+    result = []
+    for iid in sorted_ids:
+        ident = next(i for i in identities if i["identity_id"] == iid)
+        ident["member_count"] = counts.get(iid, 0)
+        result.append(ident)
+    return result[:50]  # top 50    
+    
+
 # ---------- Profile Identity Preferences ----------
 @api_router.put("/profile/identity-visibility")
 def update_identity_visibility(payload: IdentityVisibilityPayload, user: dict = Depends(get_current_user)):
@@ -586,6 +607,7 @@ def update_identity_visibility(payload: IdentityVisibilityPayload, user: dict = 
         raise HTTPException(400, "Nothing to update")
     sb.table("user_profiles").update(updates).eq("user_id", user["user_id"]).execute()
     return {"ok": True}
+
 
 
 
