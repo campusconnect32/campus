@@ -478,6 +478,27 @@ def list_identities(search: Optional[str] = None, user: dict = Depends(get_curre
 
     return identities
 
+
+@api_router.get("/identities/leaderboard")
+def identity_leaderboard(user: dict = Depends(get_current_user)):
+    identities = sb.table("identities").select("*").execute().data or []
+    if not identities:
+        return []
+    ids = [i["identity_id"] for i in identities]
+    # Fetch all claims for these identities
+    claims = sb.table("user_identity_claims").select("identity_id").in_("identity_id", ids).execute().data or []
+    # Count manually
+    from collections import Counter
+    counts = Counter(c["identity_id"] for c in claims)
+    sorted_ids = sorted(ids, key=lambda x: counts.get(x, 0), reverse=True)
+    result = []
+    for iid in sorted_ids:
+        ident = next(i for i in identities if i["identity_id"] == iid)
+        ident["member_count"] = counts.get(iid, 0)
+        result.append(ident)
+    return result[:50]
+
+
 @api_router.get("/identities/{identity_id}")
 def get_identity(identity_id: str, user: dict = Depends(get_current_user)):
     identity = _maybe(sb.table("identities").select("*").eq("identity_id", identity_id).maybe_single().execute())
@@ -550,24 +571,7 @@ def unclaim_identity(identity_id: str, user: dict = Depends(get_current_user)):
     sb.table("user_identity_claims").delete().eq("claim_id", claim["claim_id"]).execute()
     return {"ok": True}
 
-@api_router.get("/identities/leaderboard")
-def identity_leaderboard(user: dict = Depends(get_current_user)):
-    identities = sb.table("identities").select("*").execute().data or []
-    if not identities:
-        return []
-    ids = [i["identity_id"] for i in identities]
-    # Fetch all claims for these identities
-    claims = sb.table("user_identity_claims").select("identity_id").in_("identity_id", ids).execute().data or []
-    # Count manually
-    from collections import Counter
-    counts = Counter(c["identity_id"] for c in claims)
-    sorted_ids = sorted(ids, key=lambda x: counts.get(x, 0), reverse=True)
-    result = []
-    for iid in sorted_ids:
-        ident = next(i for i in identities if i["identity_id"] == iid)
-        ident["member_count"] = counts.get(iid, 0)
-        result.append(ident)
-    return result[:50]
+
 
 # ---------- Profile Identity Preferences ----------
 @api_router.put("/profile/identity-visibility")
