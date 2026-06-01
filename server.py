@@ -258,6 +258,16 @@ class ReportPayload(BaseModel):
 class BlockPayload(BaseModel):
     blocked_user_id: str
 
+class CreateIdentityPayload(BaseModel):
+    title: str
+    description: Optional[str] = ""
+    claim_price: int = 0  # in diamonds
+
+class IdentityVisibilityPayload(BaseModel):
+    visible_to_same_identity: Optional[bool] = None
+    visible_identity_ids: Optional[List[str]] = None
+
+
 # ---------- Auth ----------
 def get_current_user(
     request: Request,
@@ -407,6 +417,177 @@ def online_users():
     res = sb.table("users").select("user_id", count="exact").gte("last_active", cutoff.isoformat()).execute()
     count = res.count if hasattr(res, 'count') else 0
     return {"online": count}
+
+
+# ---------- Identity ----------
+@api_router.post("/identities")
+def create_identity(payload: CreateIdentityPayload, user: dict = Depends(get_current_user)):
+    if not user.get("verified"):
+        raise HTTPException(403, "Only verified users can create identities")
+    if payload.claim_price < 0:
+        raise HTTPException(400, "Claim price cannot be negative")
+    if user.get("diamonds", 0) < 5:
+        raise HTTPException(402, "You need 5 diamonds to create an identity")
+
+    identity_id = f"id_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+    sb.table("identities").insert({
+        "identity_id": identity_id,
+        "creator_id": user["user_id"],
+        "title": payload.title.strip(),
+        "description": payload.description or "",
+        "claim_price": payload.claim_price,
+        "created_at": now,
+        "updated_at": now
+    }).execute()
+
+    # Deduct 5 diamonds from creator
+    new_diamonds = user["diamonds"] - 5
+    sb.table("users").update({"diamonds": new_diamonds}).eq("user_id", user["user_id"]).execute()
+    user["diamonds"] = new_diamonds
+
+    # Creator automatically claims their own identity for free? Not required, but we can skip.
+    return {"ok": True, "identity_id": identity_id}
+
+@api_router.get("/identities")
+def list_identities(search: Optional[str] = None, user: dict = Depends(get_current_user)):
+    query = sb.table("identities").select("*")
+    if search:
+        query = query.ilike("title", f"%{search}%")
+    identities = query.order("created_at", desc=True).execute().data or []
+
+    # Get claim counts for all identities
+    all_ids = [i["identity_id"] for i in identities]
+    if all_ids:
+        claim_counts = sb.table("user_identity_claims").select("identity_id", count="exact") \
+            .in_("identity_id", all_ids).execute()
+        # Group counts
+        counts = {}
+        for row in claim_counts.data or []:
+            counts[row["identity_id"]] = row.get("count", 0)
+        # Check if current user has claimed each
+        user_claims = sb.table("user_identity_claims").select("identity_id").eq("user_id", user["user_id"]).in_("identity_id", all_ids).execute().data or []
+        user_claimed_set = {c["identity_id"] for c in user_claims}
+    else:
+        counts = {}
+        user_claimed_set = set()
+
+    for i in identities:
+        i["member_count"] = counts.get(i["identity_id"], 0)
+        i["claimed_by_user"] = i["identity_id"] in user_claimed_set
+
+    return identities
+
+@api_router.get("/identities/{identity_id}")
+def get_identity(identity_id: str, user: dict = Depends(get_current_user)):
+    identity = _maybe(sb.table("identities").select("*").eq("identity_id", identity_id).maybe_single().execute())
+    if not identity:
+        raise HTTPException(404, "Identity not found")
+
+    # Owner info
+    owner = _maybe(sb.table("users").select("user_id,name,email").eq("user_id", identity["creator_id"]).maybe_single().execute())
+    identity["owner"] = owner
+
+    # Member count
+    members = sb.table("user_identity_claims").select("user_id").eq("identity_id", identity_id).execute().data or []
+    identity["member_count"] = len(members)
+
+    # Check if current user has claimed
+    user_claim = _maybe(sb.table("user_identity_claims").select("claim_id").eq("user_id", user["user_id"]).eq("identity_id", identity_id).maybe_single().execute())
+    identity["claimed_by_user"] = user_claim is not None
+
+    # Only owner can see list of members
+    if identity["creator_id"] == user["user_id"]:
+        member_ids = [m["user_id"] for m in members]
+        if member_ids:
+            member_profiles = sb.table("user_profiles").select("user_id,display_name,profile_image").in_("user_id", member_ids).execute().data or []
+            identity["members"] = member_profiles
+        else:
+            identity["members"] = []
+
+    return identity
+
+@api_router.post("/identities/{identity_id}/claim")
+def claim_identity(identity_id: str, user: dict = Depends(get_current_user)):
+    identity = _maybe(sb.table("identities").select("*").eq("identity_id", identity_id).maybe_single().execute())
+    if not identity:
+        raise HTTPException(404, "Identity not found")
+
+    existing = _maybe(sb.table("user_identity_claims").select("claim_id").eq("user_id", user["user_id"]).eq("identity_id", identity_id).maybe_single().execute())
+    if existing:
+        raise HTTPException(400, "You have already claimed this identity")
+
+    price = identity["claim_price"]
+    if price > 0:
+        if user.get("diamonds", 0) < price:
+            raise HTTPException(402, f"You need {price} diamonds to claim this identity")
+        # Deduct from claimer
+        new_diamonds = user["diamonds"] - price
+        sb.table("users").update({"diamonds": new_diamonds}).eq("user_id", user["user_id"]).execute()
+        user["diamonds"] = new_diamonds
+
+        # Credit to creator
+        creator_id = identity["creator_id"]
+        creator = _maybe(sb.table("users").select("diamonds").eq("user_id", creator_id).maybe_single().execute())
+        if creator:
+            sb.table("users").update({"diamonds": creator["diamonds"] + price}).eq("user_id", creator_id).execute()
+
+    claim_id = f"cl_{uuid.uuid4().hex[:12]}"
+    sb.table("user_identity_claims").insert({
+        "claim_id": claim_id,
+        "user_id": user["user_id"],
+        "identity_id": identity_id,
+        "claimed_at": datetime.now(timezone.utc).isoformat()
+    }).execute()
+
+    return {"ok": True, "claim_id": claim_id}
+
+@api_router.delete("/identities/{identity_id}/claim")
+def unclaim_identity(identity_id: str, user: dict = Depends(get_current_user)):
+    claim = _maybe(sb.table("user_identity_claims").select("claim_id").eq("user_id", user["user_id"]).eq("identity_id", identity_id).maybe_single().execute())
+    if not claim:
+        raise HTTPException(404, "You have not claimed this identity")
+    sb.table("user_identity_claims").delete().eq("claim_id", claim["claim_id"]).execute()
+    return {"ok": True}
+
+@api_router.get("/identities/leaderboard")
+def identity_leaderboard(user: dict = Depends(get_current_user)):
+    # Get all identities with claim counts sorted
+    identities = sb.table("identities").select("*").execute().data or []
+    if not identities:
+        return []
+    ids = [i["identity_id"] for i in identities]
+    claim_counts = sb.table("user_identity_claims").select("identity_id", count="exact").in_("identity_id", ids).execute()
+    counts = {row["identity_id"]: row["count"] for row in claim_counts.data}
+    sorted_ids = sorted(ids, key=lambda x: counts.get(x, 0), reverse=True)
+    result = []
+    for iid in sorted_ids:
+        ident = next(i for i in identities if i["identity_id"] == iid)
+        ident["member_count"] = counts.get(iid, 0)
+        result.append(ident)
+    return result[:50]  # top 50
+
+# ---------- Profile Identity Preferences ----------
+@api_router.put("/profile/identity-visibility")
+def update_identity_visibility(payload: IdentityVisibilityPayload, user: dict = Depends(get_current_user)):
+    updates = {}
+    if payload.visible_to_same_identity is not None:
+        updates["visible_to_same_identity"] = payload.visible_to_same_identity
+    if payload.visible_identity_ids is not None:
+        # Validate that the user has claimed these identities
+        if payload.visible_identity_ids:
+            user_claims = sb.table("user_identity_claims").select("identity_id").eq("user_id", user["user_id"]).in_("identity_id", payload.visible_identity_ids).execute().data or []
+            claimed_ids = {c["identity_id"] for c in user_claims}
+            for id in payload.visible_identity_ids:
+                if id not in claimed_ids:
+                    raise HTTPException(400, f"You have not claimed identity {id}")
+        updates["visible_identity_ids"] = payload.visible_identity_ids
+    if not updates:
+        raise HTTPException(400, "Nothing to update")
+    sb.table("user_profiles").update(updates).eq("user_id", user["user_id"]).execute()
+    return {"ok": True}
+
+
 
 # ---------- Economy ----------
 @api_router.post("/purchase/verify")
@@ -704,6 +885,8 @@ def get_profile(user: dict) -> dict:
         "hide_from_max_age": profile.get("hide_from_max_age"),
         "visible_to": profile.get("visible_to", "all"),
         "lock_all_images": profile.get("lock_all_images", False),
+        "visible_to_same_identity": profile.get("visible_to_same_identity", False),
+        "visible_identity_ids": profile.get("visible_identity_ids") or [],
         "gps_latitude": lat, "gps_longitude": lon,
         "gps_verified_at": profile.get("gps_verified_at"),
         "location_source": profile.get("location_source", "none"),
@@ -827,7 +1010,141 @@ def get_my_profile(user: dict = Depends(get_current_user)):
     return get_profile(user)
 
 # ---------- Discovery (optimised) ----------
+
+# ---------- Discovery (optimised) ----------
 @api_router.get("/discover/profiles")
+def get_discover_profiles(
+    user: dict = Depends(get_current_user),
+    page: Optional[int] = None,
+    limit: Optional[int] = None,
+    gender: Optional[str] = None,
+    min_age: Optional[int] = None,
+    max_age: Optional[int] = None,
+    country: Optional[str] = None,
+    max_distance: Optional[int] = None,
+    sexual_orientation: Optional[str] = None,
+):
+    viewer_profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
+    if not viewer_profile: return []
+    my_lat = viewer_profile.get("gps_latitude") or viewer_profile.get("latitude")
+    my_lon = viewer_profile.get("gps_longitude") or viewer_profile.get("longitude")
+    if my_lat is None or my_lon is None: return []
+
+    pref_gender = gender if gender is not None else viewer_profile.get("pref_gender", "")
+    pref_min_age = min_age if min_age is not None else viewer_profile.get("pref_min_age", 18)
+    pref_max_age = max_age if max_age is not None else viewer_profile.get("pref_max_age", 99)
+    pref_country = country if country is not None else viewer_profile.get("pref_country", "")
+    pref_max_distance = max_distance if max_distance is not None else viewer_profile.get("pref_max_distance", 50)
+    pref_sexual_orientation = sexual_orientation if sexual_orientation is not None else viewer_profile.get("pref_sexual_orientation", "")
+
+    today = datetime.now(timezone.utc).date()
+    min_birth_date = today.replace(year=today.year - pref_max_age)
+    max_birth_date = today.replace(year=today.year - pref_min_age)
+
+    matches = sb.table("profile_matches").select("*").or_(f"user1_id.eq.{user['user_id']},user2_id.eq.{user['user_id']}").execute()
+    matched_ids = set()
+    for m in (matches.data or []):
+        partner = m["user2_id"] if m["user1_id"] == user["user_id"] else m["user1_id"]
+        matched_ids.add(partner)
+
+    query = sb.table("user_profiles").select("*", count="exact") \
+        .neq("user_id", user["user_id"]) \
+        .eq("onboarding_complete", True) \
+        .not_.is_("gps_latitude", None) \
+        .eq("profile_hidden", False)
+
+    if not user.get("verified"):
+        query = query.or_("visible_to.eq.all,visible_to.is.null")
+
+    if pref_gender:
+        query = query.eq("gender", pref_gender)
+    if pref_country:
+        query = query.eq("country", pref_country)
+    if pref_sexual_orientation:
+        query = query.eq("sexual_orientation", pref_sexual_orientation)
+    if pref_min_age and pref_max_age:
+        query = query.gte("date_of_birth", min_birth_date.isoformat()) \
+                     .lte("date_of_birth", max_birth_date.isoformat())
+
+    # Exclude already matched users
+    for mid in matched_ids:
+        query = query.neq("user_id", mid)
+
+    # ---------- IDENTITY VISIBILITY FILTER ----------
+    identity_vis = viewer_profile.get("visible_to_same_identity", False)
+    visible_ids = viewer_profile.get("visible_identity_ids") or []
+
+    if identity_vis or visible_ids:
+        # Build a set of user_ids that are allowed based on identity preferences
+        allowed_user_ids = set()
+
+        if identity_vis:
+            # Get all identities the current user has claimed
+            viewer_claims = sb.table("user_identity_claims").select("identity_id").eq("user_id", user["user_id"]).execute().data or []
+            viewer_identity_ids = [c["identity_id"] for c in viewer_claims]
+            if viewer_identity_ids:
+                # Get all users who have claimed any of these identities
+                claimed_users = sb.table("user_identity_claims").select("user_id").in_("identity_id", viewer_identity_ids).execute().data or []
+                allowed_user_ids.update(cu["user_id"] for cu in claimed_users)
+            # Always include the viewer themselves
+            allowed_user_ids.add(user["user_id"])
+
+        if visible_ids:
+            # Get users who have claimed any of the explicitly specified identities
+            if visible_ids:
+                claimed_users = sb.table("user_identity_claims").select("user_id").in_("identity_id", visible_ids).execute().data or []
+                allowed_user_ids.update(cu["user_id"] for cu in claimed_users)
+                allowed_user_ids.add(user["user_id"])
+
+        if allowed_user_ids:
+            query = query.in_("user_id", list(allowed_user_ids))
+        else:
+            # If no identities match, show no one (except self, but self is already excluded)
+            # Returning an empty list or just the viewer would be odd – we'll let the query run with an empty set
+            query = query.in_("user_id", [user["user_id"]])  # only self will be excluded, so empty result
+    # --------------------------------------------
+
+    if page is not None and limit is not None:
+        start = (page - 1) * limit
+        end = start + limit - 1
+        query = query.range(start, end)
+    else:
+        query = query.limit(50)
+
+    profiles = query.execute().data or []
+    if not profiles:
+        return []
+
+    user_ids = [p["user_id"] for p in profiles]
+    users_data = sb.table("users").select("user_id,verified,premium_tier,last_active").in_("user_id", user_ids).execute().data or []
+    user_status = {u["user_id"]: u for u in users_data}
+
+    filtered = []
+    for p in profiles:
+        if p.get("profile_hidden"): continue
+        p_lat = p.get("gps_latitude"); p_lon = p.get("gps_longitude")
+        distance = None
+        if p_lat is not None and p_lon is not None:
+            distance = haversine(my_lat, my_lon, p_lat, p_lon)
+            if pref_max_distance and distance > pref_max_distance: continue
+        p["distance_km"] = round(distance, 1) if distance is not None else None
+        status = user_status.get(p["user_id"], {})
+        p["verified"] = status.get("verified", False)
+        p["premium_tier"] = status.get("premium_tier")
+        p["last_active"] = status.get("last_active")
+        filtered.append(p)
+
+    if not is_premium(user):
+        require_token(user, len(filtered))
+
+    return filtered
+
+
+
+
+"""@api_router.get("/discover/profiles")
+
+
 def get_discover_profiles(
     user: dict = Depends(get_current_user),
     page: Optional[int] = None,
@@ -917,7 +1234,9 @@ def get_discover_profiles(
     if not is_premium(user):
         require_token(user, len(filtered))
 
-    return filtered
+    return filtered """
+
+
 
 @api_router.post("/discover/swipe")
 def swipe_profile(payload: SwipePayload, user: dict = Depends(get_current_user)):
@@ -2494,3 +2813,6 @@ app.include_router(api_router)
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT",8000)))
+    
+    
+   get_profile
