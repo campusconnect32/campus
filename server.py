@@ -203,7 +203,7 @@ class GoogleAuthPayload(BaseModel):
     id_token: str; email: str; name: str; picture: str; ref: Optional[str] = None
 
 class ProfileSetupPayload(BaseModel):
-    date_of_birth: str; gender: str; health_status: str
+    date_of_birth: str; gender: str
     sexual_orientation: Optional[str] = ""
     positive_since: Optional[str] = ""
     height: Optional[str] = ""
@@ -217,16 +217,15 @@ class ProfileSetupPayload(BaseModel):
     profile_image: Optional[str] = ""; gallery_images: Optional[List[str]] = []
     pref_gender: Optional[str] = ""; pref_min_age: Optional[int] = 18
     pref_max_age: Optional[int] = 99; pref_country: Optional[str] = ""
-    pref_max_distance: Optional[int] = 50; pref_health_status: Optional[str] = ""
+    pref_max_distance: Optional[int] = 50
     pref_sexual_orientation: Optional[str] = ""
     profile_hidden: Optional[bool] = False
     hide_from_min_age: Optional[int] = None; hide_from_max_age: Optional[int] = None
-    hide_from_health_statuses: Optional[str] = ""
     visible_to: Optional[str] = "all"
     lock_all_images: Optional[bool] = False
 
 class ProfileUpdatePayload(BaseModel):
-    date_of_birth: Optional[str] = None; gender: Optional[str] = None; health_status: Optional[str] = None
+    date_of_birth: Optional[str] = None; gender: Optional[str] = None
     sexual_orientation: Optional[str] = None
     positive_since: Optional[str] = None
     height: Optional[str] = None
@@ -239,11 +238,10 @@ class ProfileUpdatePayload(BaseModel):
     gallery_images: Optional[List[str]] = None
     pref_gender: Optional[str] = None; pref_min_age: Optional[int] = None
     pref_max_age: Optional[int] = None; pref_country: Optional[str] = None
-    pref_max_distance: Optional[int] = None; pref_health_status: Optional[str] = None
+    pref_max_distance: Optional[int] = None
     pref_sexual_orientation: Optional[str] = None
     profile_hidden: Optional[bool] = None
     hide_from_min_age: Optional[int] = None; hide_from_max_age: Optional[int] = None
-    hide_from_health_statuses: Optional[str] = None
     visible_to: Optional[str] = None
     lock_all_images: Optional[bool] = None
 
@@ -660,16 +658,15 @@ def get_profile(user: dict) -> dict:
         return {
             "user_id": user["user_id"], "email": user.get("email",""), "name": user.get("name",""),
             "date_of_birth": None, "gender": None, "country": None, "city": None,
-            "health_status": None, "latitude": None, "longitude": None,
+            "latitude": None, "longitude": None,
             "sexual_orientation": "", "positive_since": "", "height": "", "ethnicity": "", "religion": "",
             "display_name": user.get("name",""), "bio": "", "interests": "", "looking_for": "",
             "education": "", "kids": "", "want_kids": "", "smoke": "", "drink": "", "employment": "",
             "profile_image": user.get("picture",""), "gallery_images": [],
             "onboarding_complete": False,
             "pref_gender": "", "pref_min_age": 18, "pref_max_age": 99,
-            "pref_country": "", "pref_max_distance": 50, "pref_health_status": "",
+            "pref_country": "", "pref_max_distance": 50,
             "profile_hidden": False, "hide_from_min_age": None, "hide_from_max_age": None,
-            "hide_from_health_statuses": "",
             "gps_latitude": None, "gps_longitude": None, "gps_verified_at": None,
             "location_source": "none",
             "last_active": user.get("last_active"),
@@ -683,7 +680,6 @@ def get_profile(user: dict) -> dict:
         "user_id": profile["user_id"], "email": user.get("email",""), "name": user.get("name",""),
         "date_of_birth": profile.get("date_of_birth"), "gender": profile.get("gender"),
         "country": country, "city": city,
-        "health_status": profile.get("health_status"),
         "latitude": lat, "longitude": lon,
         "sexual_orientation": profile.get("sexual_orientation",""),
         "positive_since": profile.get("positive_since",""),
@@ -702,12 +698,10 @@ def get_profile(user: dict) -> dict:
         "pref_gender": profile.get("pref_gender",""), "pref_min_age": profile.get("pref_min_age",18),
         "pref_max_age": profile.get("pref_max_age",99), "pref_country": profile.get("pref_country",""),
         "pref_max_distance": profile.get("pref_max_distance",50),
-        "pref_health_status": profile.get("pref_health_status",""),
         "pref_sexual_orientation": profile.get("pref_sexual_orientation",""),
         "profile_hidden": profile.get("profile_hidden", False),
         "hide_from_min_age": profile.get("hide_from_min_age"),
         "hide_from_max_age": profile.get("hide_from_max_age"),
-        "hide_from_health_statuses": profile.get("hide_from_health_statuses",""),
         "visible_to": profile.get("visible_to", "all"),
         "lock_all_images": profile.get("lock_all_images", False),
         "gps_latitude": lat, "gps_longitude": lon,
@@ -742,7 +736,7 @@ def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current
         gallery.append(process_image_field(img, user["user_id"], f"gallery_{i}"))
     profile_data = {
         "user_id": user["user_id"], "date_of_birth": payload.date_of_birth, "gender": payload.gender,
-        "country": country, "city": city, "health_status": payload.health_status,
+        "country": country, "city": city,
         "sexual_orientation": payload.sexual_orientation or "",
         "positive_since": payload.positive_since or "",
         "height": payload.height or "",
@@ -759,12 +753,10 @@ def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current
         "pref_gender": payload.pref_gender or "", "pref_min_age": payload.pref_min_age,
         "pref_max_age": payload.pref_max_age, "pref_country": payload.pref_country or "",
         "pref_max_distance": payload.pref_max_distance,
-        "pref_health_status": payload.pref_health_status or "",
         "pref_sexual_orientation": payload.pref_sexual_orientation or "",
         "profile_hidden": payload.profile_hidden if user.get("verified") else False,
         "hide_from_min_age": payload.hide_from_min_age if user.get("verified") else None,
         "hide_from_max_age": payload.hide_from_max_age if user.get("verified") else None,
-        "hide_from_health_statuses": payload.hide_from_health_statuses if user.get("verified") else "",
         "visible_to": payload.visible_to if user.get("verified") else "all",
         "lock_all_images": payload.lock_all_images if user.get("verified") else False,
         "onboarding_complete": True,
@@ -786,13 +778,13 @@ def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current
 def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_current_user)):
     updates = {}
     all_fields = [
-        "date_of_birth", "gender", "health_status",
+        "date_of_birth", "gender",
         "sexual_orientation", "positive_since", "height", "ethnicity", "religion",
         "display_name", "bio", "interests", "looking_for",
         "education", "kids", "want_kids", "smoke", "drink", "employment",
         "pref_gender", "pref_min_age", "pref_max_age", "pref_country",
-        "pref_max_distance", "pref_health_status", "pref_sexual_orientation",
-        "hide_from_min_age", "hide_from_max_age", "hide_from_health_statuses",
+        "pref_max_distance", "pref_sexual_orientation",
+        "hide_from_min_age", "hide_from_max_age",
         "visible_to", "lock_all_images"
     ]
     for field in all_fields:
@@ -841,7 +833,6 @@ def get_discover_profiles(
     page: Optional[int] = None,
     limit: Optional[int] = None,
     gender: Optional[str] = None,
-    health_status: Optional[str] = None,
     min_age: Optional[int] = None,
     max_age: Optional[int] = None,
     country: Optional[str] = None,
@@ -855,7 +846,6 @@ def get_discover_profiles(
     if my_lat is None or my_lon is None: return []
 
     pref_gender = gender if gender is not None else viewer_profile.get("pref_gender", "")
-    pref_health = health_status if health_status is not None else viewer_profile.get("pref_health_status", "")
     pref_min_age = min_age if min_age is not None else viewer_profile.get("pref_min_age", 18)
     pref_max_age = max_age if max_age is not None else viewer_profile.get("pref_max_age", 99)
     pref_country = country if country is not None else viewer_profile.get("pref_country", "")
@@ -883,8 +873,6 @@ def get_discover_profiles(
 
     if pref_gender:
         query = query.eq("gender", pref_gender)
-    if pref_health:
-        query = query.eq("health_status", pref_health)
     if pref_country:
         query = query.eq("country", pref_country)
     if pref_sexual_orientation:
@@ -998,7 +986,6 @@ def get_matches(swipe_type: Optional[str] = 'dating', user: dict = Depends(get_c
                 "display_name": profile.get("display_name",""),
                 "profile_image": profile.get("profile_image",""),
                 "bio": profile.get("bio",""), "country": profile.get("country",""), "city": profile.get("city",""),
-                "health_status": profile.get("health_status"),
                 "created_at": m["created_at"], "unread_count": unread
             })
     return result
@@ -1156,7 +1143,8 @@ def create_story(payload: CreateStoryPayload, user: dict = Depends(get_current_u
     if not user.get("verified"):
         raise HTTPException(403, "Only verified users can post stories")
     if contains_profanity(payload.content): raise HTTPException(400, "Story contains inappropriate language")
-    if payload.category not in ["HIV","HPV","HSV","Other STD"]: raise HTTPException(400)
+    # 🔄 Updated to new generic categories
+    if payload.category not in ["Personal","Support","Community","Inspiration"]: raise HTTPException(400)
     profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
     author_avatar = profile.get("profile_image") if profile else user.get("picture","")
     story = {"story_id": f"story_{uuid.uuid4().hex[:12]}", "user_id": user["user_id"],
@@ -1251,7 +1239,10 @@ def edit_story(story_id: str, payload: CreateStoryPayload, user: dict = Depends(
     updates = {}
     if payload.title is not None: updates["title"] = payload.title
     if payload.content is not None: updates["content"] = payload.content
-    if payload.category is not None: updates["category"] = payload.category
+    if payload.category is not None:
+        if payload.category not in ["Personal","Support","Community","Inspiration"]:
+            raise HTTPException(400, "Invalid category")
+        updates["category"] = payload.category
     if updates:
         updates["updated_at"] = datetime.now(timezone.utc).isoformat()
         sb.table("stories").update(updates).eq("story_id", story_id).execute()
@@ -1314,7 +1305,8 @@ def flexer_board(user:dict=Depends(get_current_user)):
     cards = sb.table("flexer_cards").select("*").gt("expires_at",now).order("diamonds_committed",desc=True).limit(100).execute().data or []
     result=[]
     for c in cards:
-        profile = _maybe(sb.table("user_profiles").select("display_name,profile_image,date_of_birth,country,city,health_status").eq("user_id",c["user_id"]).maybe_single().execute())
+        # 🩺 Removed health_status fetch
+        profile = _maybe(sb.table("user_profiles").select("display_name,profile_image,date_of_birth,country,city").eq("user_id",c["user_id"]).maybe_single().execute())
         if profile:
             age=None
             if profile.get("date_of_birth"):
@@ -1323,7 +1315,7 @@ def flexer_board(user:dict=Depends(get_current_user)):
                     today=datetime.now(timezone.utc).date()
                     age=today.year-dob.year-((today.month,today.day)<(dob.month,dob.day))
                 except: pass
-            result.append({"card_id":c["card_id"],"user_id":c["user_id"],"display_name":profile.get("display_name","Someone"),"profile_image":profile.get("profile_image",""),"age":age,"country":profile.get("country",""),"city":profile.get("city",""),"health_status":profile.get("health_status"),"diamonds_committed":c["diamonds_committed"],"expires_at":c["expires_at"]})
+            result.append({"card_id":c["card_id"],"user_id":c["user_id"],"display_name":profile.get("display_name","Someone"),"profile_image":profile.get("profile_image",""),"age":age,"country":profile.get("country",""),"city":profile.get("city",""),"diamonds_committed":c["diamonds_committed"],"expires_at":c["expires_at"]})
     return result
 
 # ---------- Countries/Cities ----------
@@ -1615,45 +1607,6 @@ def report_content(payload: dict, user: dict = Depends(get_current_user)):
     )
 
     return {"ok": True}
-
-
-
-""" @api_router.post("/report-content")
-def report_content(payload: dict, user: dict = Depends(get_current_user)):
-    reported_user_id = payload.get("reported_user_id")
-    reason = payload.get("reason", "")
-    image_index = payload.get("image_index")
-    story_id = payload.get("story_id")
-
-    if not reported_user_id or not reason:
-        raise HTTPException(400, "Missing reported_user_id or reason")
-
-    # Build a descriptive reason text that includes the context
-    full_reason = reason
-    if image_index is not None:
-        full_reason += f" (image {image_index})"
-    if story_id:
-        full_reason += f" (story {story_id})"
-
-    # Insert with a new UUID for report_id
-    sb.table("user_reports").insert({
-        "report_id": str(uuid.uuid4()),          # ← this was missing
-        "reporter_id": user["user_id"],
-        "reported_user_id": reported_user_id,
-        "reason": full_reason,
-        "created_at": datetime.utcnow().isoformat()
-    }).execute()
-
-    # Notify the reported user
-    notify_user(
-        reported_user_id,
-        "warning",
-        f"Your content has been reported for: {reason}. Our team will review it.",
-        user["user_id"]
-    )
-
-    return {"ok": True} """
-
 
 
 
@@ -2540,6 +2493,4 @@ app.include_router(api_router)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT",8000)))  
-    
-  
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT",8000)))
