@@ -13,8 +13,7 @@ from PIL import Image
 import httpx as httpx_lib
 import uuid
 import bcrypt
-import threading   # add this at the very top of server.py if not already there
-
+import threading
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -45,8 +44,8 @@ app.add_middleware(
 api_router = APIRouter(prefix="/api")
 
 # ---------- Simple in‑memory rate limiter ----------
-RATE_LIMIT_WINDOW = 60  # seconds
-RATE_LIMIT_MAX = 10     # requests per window
+RATE_LIMIT_WINDOW = 60
+RATE_LIMIT_MAX = 10
 rate_limit_store: Dict[str, list] = {}
 
 def check_rate_limit(key: str, max_req: int = RATE_LIMIT_MAX, window: int = RATE_LIMIT_WINDOW):
@@ -67,7 +66,7 @@ GOLD_COST = 39
 GOLD_DAYS = 30
 PREMIUM_COST = 199
 PREMIUM_DAYS = 180
-MAX_IMAGE_BASE64_SIZE = 5 * 1024 * 1024  # 5 MB
+MAX_IMAGE_BASE64_SIZE = 5 * 1024 * 1024
 
 PROFANITY_LIST = {"fuck","shit","bitch","asshole","bastard","dick","pussy","cunt","whore"}
 ETHNICITY_LIST = [
@@ -244,6 +243,8 @@ class ProfileUpdatePayload(BaseModel):
     hide_from_min_age: Optional[int] = None; hide_from_max_age: Optional[int] = None
     visible_to: Optional[str] = None
     lock_all_images: Optional[bool] = None
+    visible_to_same_identity: Optional[bool] = None
+    visible_identity_ids: Optional[List[str]] = None
 
 class CreateStoryPayload(BaseModel):
     content: str; category: str; title: Optional[str] = ""
@@ -261,7 +262,7 @@ class BlockPayload(BaseModel):
 class CreateIdentityPayload(BaseModel):
     title: str
     description: Optional[str] = ""
-    claim_price: int = 0  # in diamonds
+    claim_price: int = 0
 
 class IdentityVisibilityPayload(BaseModel):
     visible_to_same_identity: Optional[bool] = None
@@ -286,7 +287,6 @@ def get_current_user(
     if user.get("deleted"):
         raise HTTPException(status_code=401, detail="Account deleted")
 
-    # Auto‑renew / expiry check
     old_tier = user.get("premium_tier")
     if old_tier and not is_premium(user):
         if user.get("auto_renew"):
@@ -331,7 +331,6 @@ def auth_google(payload: GoogleAuthPayload, request: Request, response: Response
         user_id = existing["user_id"]
         sb.table("users").update({"name": name, "picture": picture, "last_active": now_iso, "deleted": False}).eq("user_id", user_id).execute()
     else:
-        # Check if there's a deleted account with this email
         deleted_user = _maybe(sb.table("users").select("*").eq("email", email).eq("deleted", True).maybe_single().execute())
         if deleted_user:
             if deleted_user.get("banned"):
@@ -441,12 +440,10 @@ def create_identity(payload: CreateIdentityPayload, user: dict = Depends(get_cur
         "updated_at": now
     }).execute()
 
-    # Deduct 5 diamonds from creator
     new_diamonds = user["diamonds"] - 5
     sb.table("users").update({"diamonds": new_diamonds}).eq("user_id", user["user_id"]).execute()
     user["diamonds"] = new_diamonds
 
-    # Creator automatically claims their own identity for free? Not required, but we can skip.
     return {"ok": True, "identity_id": identity_id}
 
 @api_router.get("/identities")
@@ -456,16 +453,11 @@ def list_identities(search: Optional[str] = None, user: dict = Depends(get_curre
         query = query.ilike("title", f"%{search}%")
     identities = query.order("created_at", desc=True).execute().data or []
 
-    # Get claim counts for all identities
     all_ids = [i["identity_id"] for i in identities]
     if all_ids:
-        claim_counts = sb.table("user_identity_claims").select("identity_id", count="exact") \
-            .in_("identity_id", all_ids).execute()
-        # Group counts
-        counts = {}
-        for row in claim_counts.data or []:
-            counts[row["identity_id"]] = row.get("count", 0)
-        # Check if current user has claimed each
+        claims = sb.table("user_identity_claims").select("identity_id").in_("identity_id", all_ids).execute().data or []
+        from collections import Counter
+        counts = Counter(c["identity_id"] for c in claims)
         user_claims = sb.table("user_identity_claims").select("identity_id").eq("user_id", user["user_id"]).in_("identity_id", all_ids).execute().data or []
         user_claimed_set = {c["identity_id"] for c in user_claims}
     else:
@@ -478,16 +470,13 @@ def list_identities(search: Optional[str] = None, user: dict = Depends(get_curre
 
     return identities
 
-
 @api_router.get("/identities/leaderboard")
 def identity_leaderboard(user: dict = Depends(get_current_user)):
     identities = sb.table("identities").select("*").execute().data or []
     if not identities:
         return []
     ids = [i["identity_id"] for i in identities]
-    # Fetch all claims for these identities
     claims = sb.table("user_identity_claims").select("identity_id").in_("identity_id", ids).execute().data or []
-    # Count manually
     from collections import Counter
     counts = Counter(c["identity_id"] for c in claims)
     sorted_ids = sorted(ids, key=lambda x: counts.get(x, 0), reverse=True)
@@ -498,26 +487,21 @@ def identity_leaderboard(user: dict = Depends(get_current_user)):
         result.append(ident)
     return result[:50]
 
-
 @api_router.get("/identities/{identity_id}")
 def get_identity(identity_id: str, user: dict = Depends(get_current_user)):
     identity = _maybe(sb.table("identities").select("*").eq("identity_id", identity_id).maybe_single().execute())
     if not identity:
         raise HTTPException(404, "Identity not found")
 
-    # Owner info
     owner = _maybe(sb.table("users").select("user_id,name,email").eq("user_id", identity["creator_id"]).maybe_single().execute())
     identity["owner"] = owner
 
-    # Member count
     members = sb.table("user_identity_claims").select("user_id").eq("identity_id", identity_id).execute().data or []
     identity["member_count"] = len(members)
 
-    # Check if current user has claimed
     user_claim = _maybe(sb.table("user_identity_claims").select("claim_id").eq("user_id", user["user_id"]).eq("identity_id", identity_id).maybe_single().execute())
     identity["claimed_by_user"] = user_claim is not None
 
-    # Only owner can see list of members
     if identity["creator_id"] == user["user_id"]:
         member_ids = [m["user_id"] for m in members]
         if member_ids:
@@ -542,12 +526,10 @@ def claim_identity(identity_id: str, user: dict = Depends(get_current_user)):
     if price > 0:
         if user.get("diamonds", 0) < price:
             raise HTTPException(402, f"You need {price} diamonds to claim this identity")
-        # Deduct from claimer
         new_diamonds = user["diamonds"] - price
         sb.table("users").update({"diamonds": new_diamonds}).eq("user_id", user["user_id"]).execute()
         user["diamonds"] = new_diamonds
 
-        # Credit to creator
         creator_id = identity["creator_id"]
         creator = _maybe(sb.table("users").select("diamonds").eq("user_id", creator_id).maybe_single().execute())
         if creator:
@@ -572,7 +554,6 @@ def unclaim_identity(identity_id: str, user: dict = Depends(get_current_user)):
     return {"ok": True}
 
 
-
 # ---------- Profile Identity Preferences ----------
 @api_router.put("/profile/identity-visibility")
 def update_identity_visibility(payload: IdentityVisibilityPayload, user: dict = Depends(get_current_user)):
@@ -580,7 +561,6 @@ def update_identity_visibility(payload: IdentityVisibilityPayload, user: dict = 
     if payload.visible_to_same_identity is not None:
         updates["visible_to_same_identity"] = payload.visible_to_same_identity
     if payload.visible_identity_ids is not None:
-        # Validate that the user has claimed these identities
         if payload.visible_identity_ids:
             user_claims = sb.table("user_identity_claims").select("identity_id").eq("user_id", user["user_id"]).in_("identity_id", payload.visible_identity_ids).execute().data or []
             claimed_ids = {c["identity_id"] for c in user_claims}
@@ -592,8 +572,6 @@ def update_identity_visibility(payload: IdentityVisibilityPayload, user: dict = 
         raise HTTPException(400, "Nothing to update")
     sb.table("user_profiles").update(updates).eq("user_id", user["user_id"]).execute()
     return {"ok": True}
-
-
 
 
 # ---------- Economy ----------
@@ -634,11 +612,7 @@ def toggle_auto_renew(user: dict = Depends(get_current_user)):
 PAYPAL_API_BASE = "https://api-m.paypal.com"
 
 @api_router.post("/diamonds/create-order")
-async def create_diamond_order(
-    package_id: str,
-    request: Request,
-    user: dict = Depends(get_current_user)
-):
+async def create_diamond_order(package_id: str, request: Request, user: dict = Depends(get_current_user)):
     packages = {
         "52":  {"diamonds": 52,  "amount": 3.00,  "label": "$3"},
         "120": {"diamonds": 120, "amount": 7.00,  "label": "$7"},
@@ -698,11 +672,7 @@ async def create_diamond_order(
     return order_response.json()
 
 @api_router.post("/diamonds/capture-order")
-async def capture_diamond_order(
-    order_id: str,
-    package_id: str,
-    user: dict = Depends(get_current_user)
-):
+async def capture_diamond_order(order_id: str, package_id: str, user: dict = Depends(get_current_user)):
     PAYPAL_CLIENT_ID = os.environ.get("PAYPAL_CLIENT_ID")
     PAYPAL_CLIENT_SECRET = os.environ.get("PAYPAL_CLIENT_SECRET")
     if not PAYPAL_CLIENT_ID or not PAYPAL_CLIENT_SECRET:
@@ -752,7 +722,7 @@ async def capture_diamond_order(
 
     return {"ok": True, "diamonds": new_diamonds}
 
-# ---------- Earn tokens (game) ----------
+# ---------- Earn tokens ----------
 @api_router.post("/earn-tokens")
 def earn_tokens(user: dict = Depends(get_current_user)):
     if is_premium(user):
@@ -766,7 +736,6 @@ def earn_tokens(user: dict = Depends(get_current_user)):
     sb.table("users").update({"tokens": new_tokens, "last_token_earned": datetime.now(timezone.utc).isoformat()}).eq("user_id", user["user_id"]).execute()
     return {"ok": True, "tokens_awarded": 15, "total_tokens": new_tokens}
 
-# ---------- Earn tokens from ad (button) ----------
 @api_router.post("/earn-tokens-ad")
 def earn_tokens_ad(user: dict = Depends(get_current_user)):
     if is_premium(user):
@@ -835,7 +804,6 @@ def get_location_status(user: dict = Depends(get_current_user)):
 
 # ---------- Profile ----------
 def get_profile(user: dict) -> dict:
-    # If we only have a user_id, fetch the full user row first
     if "email" not in user or "last_active" not in user:
         full_user = _maybe(sb.table("users").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
         if full_user:
@@ -859,7 +827,9 @@ def get_profile(user: dict) -> dict:
             "location_source": "none",
             "last_active": user.get("last_active"),
             "verified": False, "premium_tier": None,
-            "visible_to": "all", "pref_sexual_orientation": "", "lock_all_images": False
+            "visible_to": "all", "pref_sexual_orientation": "", "lock_all_images": False,
+            "visible_to_same_identity": False,
+            "visible_identity_ids": []
         }
     lat = profile.get("gps_latitude"); lon = profile.get("gps_longitude")
     country = profile.get("country") if lat is not None else None
@@ -897,12 +867,10 @@ def get_profile(user: dict) -> dict:
         "gps_latitude": lat, "gps_longitude": lon,
         "gps_verified_at": profile.get("gps_verified_at"),
         "location_source": profile.get("location_source", "none"),
-        "last_active": user.get("last_active"),        # now properly fetched
+        "last_active": user.get("last_active"),
         "verified": user.get("verified", False),
         "premium_tier": user.get("premium_tier")
     }
-
-
 
 @api_router.post("/profile/setup")
 def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current_user)):
@@ -975,7 +943,9 @@ def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_curre
         "pref_gender", "pref_min_age", "pref_max_age", "pref_country",
         "pref_max_distance", "pref_sexual_orientation",
         "hide_from_min_age", "hide_from_max_age",
-        "visible_to", "lock_all_images"
+        "visible_to", "lock_all_images",
+        "visible_to_same_identity",
+        "visible_identity_ids"
     ]
     for field in all_fields:
         value = getattr(payload, field, None)
@@ -1016,9 +986,7 @@ def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_curre
 def get_my_profile(user: dict = Depends(get_current_user)):
     return get_profile(user)
 
-# ---------- Discovery (optimised) ----------
-
-# ---------- Discovery (optimised) ----------
+# ---------- Discovery ----------
 @api_router.get("/discover/profiles")
 def get_discover_profiles(
     user: dict = Depends(get_current_user),
@@ -1073,31 +1041,25 @@ def get_discover_profiles(
         query = query.gte("date_of_birth", min_birth_date.isoformat()) \
                      .lte("date_of_birth", max_birth_date.isoformat())
 
-    # Exclude already matched users
     for mid in matched_ids:
         query = query.neq("user_id", mid)
 
-    # ---------- IDENTITY VISIBILITY FILTER ----------
+    # Identity visibility filter
     identity_vis = viewer_profile.get("visible_to_same_identity", False)
     visible_ids = viewer_profile.get("visible_identity_ids") or []
 
     if identity_vis or visible_ids:
-        # Build a set of user_ids that are allowed based on identity preferences
         allowed_user_ids = set()
 
         if identity_vis:
-            # Get all identities the current user has claimed
             viewer_claims = sb.table("user_identity_claims").select("identity_id").eq("user_id", user["user_id"]).execute().data or []
             viewer_identity_ids = [c["identity_id"] for c in viewer_claims]
             if viewer_identity_ids:
-                # Get all users who have claimed any of these identities
                 claimed_users = sb.table("user_identity_claims").select("user_id").in_("identity_id", viewer_identity_ids).execute().data or []
                 allowed_user_ids.update(cu["user_id"] for cu in claimed_users)
-            # Always include the viewer themselves
             allowed_user_ids.add(user["user_id"])
 
         if visible_ids:
-            # Get users who have claimed any of the explicitly specified identities
             if visible_ids:
                 claimed_users = sb.table("user_identity_claims").select("user_id").in_("identity_id", visible_ids).execute().data or []
                 allowed_user_ids.update(cu["user_id"] for cu in claimed_users)
@@ -1106,10 +1068,7 @@ def get_discover_profiles(
         if allowed_user_ids:
             query = query.in_("user_id", list(allowed_user_ids))
         else:
-            # If no identities match, show no one (except self, but self is already excluded)
-            # Returning an empty list or just the viewer would be odd – we'll let the query run with an empty set
-            query = query.in_("user_id", [user["user_id"]])  # only self will be excluded, so empty result
-    # --------------------------------------------
+            query = query.in_("user_id", [user["user_id"]])
 
     if page is not None and limit is not None:
         start = (page - 1) * limit
@@ -1146,105 +1105,7 @@ def get_discover_profiles(
 
     return filtered
 
-
-
-
-"""@api_router.get("/discover/profiles")
-
-
-def get_discover_profiles(
-    user: dict = Depends(get_current_user),
-    page: Optional[int] = None,
-    limit: Optional[int] = None,
-    gender: Optional[str] = None,
-    min_age: Optional[int] = None,
-    max_age: Optional[int] = None,
-    country: Optional[str] = None,
-    max_distance: Optional[int] = None,
-    sexual_orientation: Optional[str] = None,
-):
-    viewer_profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
-    if not viewer_profile: return []
-    my_lat = viewer_profile.get("gps_latitude") or viewer_profile.get("latitude")
-    my_lon = viewer_profile.get("gps_longitude") or viewer_profile.get("longitude")
-    if my_lat is None or my_lon is None: return []
-
-    pref_gender = gender if gender is not None else viewer_profile.get("pref_gender", "")
-    pref_min_age = min_age if min_age is not None else viewer_profile.get("pref_min_age", 18)
-    pref_max_age = max_age if max_age is not None else viewer_profile.get("pref_max_age", 99)
-    pref_country = country if country is not None else viewer_profile.get("pref_country", "")
-    pref_max_distance = max_distance if max_distance is not None else viewer_profile.get("pref_max_distance", 50)
-    pref_sexual_orientation = sexual_orientation if sexual_orientation is not None else viewer_profile.get("pref_sexual_orientation", "")
-
-    today = datetime.now(timezone.utc).date()
-    min_birth_date = today.replace(year=today.year - pref_max_age)
-    max_birth_date = today.replace(year=today.year - pref_min_age)
-
-    matches = sb.table("profile_matches").select("*").or_(f"user1_id.eq.{user['user_id']},user2_id.eq.{user['user_id']}").execute()
-    matched_ids = set()
-    for m in (matches.data or []):
-        partner = m["user2_id"] if m["user1_id"] == user["user_id"] else m["user1_id"]
-        matched_ids.add(partner)
-
-    query = sb.table("user_profiles").select("*", count="exact") \
-        .neq("user_id", user["user_id"]) \
-        .eq("onboarding_complete", True) \
-        .not_.is_("gps_latitude", None) \
-        .eq("profile_hidden", False)
-
-    if not user.get("verified"):
-        query = query.or_("visible_to.eq.all,visible_to.is.null")
-
-    if pref_gender:
-        query = query.eq("gender", pref_gender)
-    if pref_country:
-        query = query.eq("country", pref_country)
-    if pref_sexual_orientation:
-        query = query.eq("sexual_orientation", pref_sexual_orientation)
-    if pref_min_age and pref_max_age:
-        query = query.gte("date_of_birth", min_birth_date.isoformat()) \
-                     .lte("date_of_birth", max_birth_date.isoformat())
-
-    for mid in matched_ids:
-        query = query.neq("user_id", mid)
-
-    if page is not None and limit is not None:
-        start = (page - 1) * limit
-        end = start + limit - 1
-        query = query.range(start, end)
-    else:
-        query = query.limit(50)
-
-    profiles = query.execute().data or []
-    if not profiles:
-        return []
-
-    user_ids = [p["user_id"] for p in profiles]
-    users_data = sb.table("users").select("user_id,verified,premium_tier,last_active").in_("user_id", user_ids).execute().data or []
-    user_status = {u["user_id"]: u for u in users_data}
-
-    filtered = []
-    for p in profiles:
-        if p.get("profile_hidden"): continue
-        p_lat = p.get("gps_latitude"); p_lon = p.get("gps_longitude")
-        distance = None
-        if p_lat is not None and p_lon is not None:
-            distance = haversine(my_lat, my_lon, p_lat, p_lon)
-            if pref_max_distance and distance > pref_max_distance: continue
-        p["distance_km"] = round(distance, 1) if distance is not None else None
-        status = user_status.get(p["user_id"], {})
-        p["verified"] = status.get("verified", False)
-        p["premium_tier"] = status.get("premium_tier")
-        p["last_active"] = status.get("last_active")
-        filtered.append(p)
-
-    if not is_premium(user):
-        require_token(user, len(filtered))
-
-    return filtered """
-
-
-
+# ---------- Swipe ----------
 @api_router.post("/discover/swipe")
 def swipe_profile(payload: SwipePayload, user: dict = Depends(get_current_user)):
     if not is_premium(user):
@@ -1290,7 +1151,7 @@ def swipe_profile(payload: SwipePayload, user: dict = Depends(get_current_user))
             else: match_id = exist_match["match_id"]
     return {"ok": True, "matched": matched, "match_id": match_id, "direction": payload.direction}
 
-# ---------- Random Chat token charge ----------
+# ---------- Random Chat ----------
 @api_router.post("/chat/start")
 def chat_start(user: dict = Depends(get_current_user)):
     require_token(user, 1)
@@ -1469,7 +1330,6 @@ def create_story(payload: CreateStoryPayload, user: dict = Depends(get_current_u
     if not user.get("verified"):
         raise HTTPException(403, "Only verified users can post stories")
     if contains_profanity(payload.content): raise HTTPException(400, "Story contains inappropriate language")
-    # 🔄 Updated to new generic categories
     if payload.category not in ["Personal","Support","Community","Inspiration"]: raise HTTPException(400)
     profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
     author_avatar = profile.get("profile_image") if profile else user.get("picture","")
@@ -1631,7 +1491,6 @@ def flexer_board(user:dict=Depends(get_current_user)):
     cards = sb.table("flexer_cards").select("*").gt("expires_at",now).order("diamonds_committed",desc=True).limit(100).execute().data or []
     result=[]
     for c in cards:
-        # 🩺 Removed health_status fetch
         profile = _maybe(sb.table("user_profiles").select("display_name,profile_image,date_of_birth,country,city").eq("user_id",c["user_id"]).maybe_single().execute())
         if profile:
             age=None
@@ -1668,7 +1527,6 @@ def get_cities(country:str):
 def admin_check(user: dict = Depends(get_current_user)):
     return {"is_admin": user.get("is_admin", False)}
 
-# ---------- Reports ----------
 @api_router.get("/admin/reports")
 def admin_get_reports(user: dict = Depends(get_current_user)):
     if not user.get("is_admin"):
@@ -1697,24 +1555,20 @@ def admin_resolve_report(report_id: str, user: dict = Depends(get_current_user))
     sb.table("user_reports").delete().eq("report_id", report_id).execute()
     return {"ok": True}
 
-# ---------- Ban / Unban ----------
 @api_router.post("/admin/ban")
 def admin_ban_user(payload: dict, user: dict = Depends(get_current_user)):
     if not user.get("is_admin"):
         raise HTTPException(403, "Admin access required")
     target_id = payload.get("user_id")
     reason = payload.get("reason", "")
-    duration_days = payload.get("duration_days")  # None = permanent
-
+    duration_days = payload.get("duration_days")
     if not target_id:
         raise HTTPException(400, "Missing user_id")
-
     update_data = {"deleted": True, "banned": True, "banned_reason": reason}
     if duration_days:
         update_data["banned_until"] = (datetime.now(timezone.utc) + timedelta(days=duration_days)).isoformat()
     else:
         update_data["banned_until"] = None
-
     sb.table("users").update(update_data).eq("user_id", target_id).execute()
     sb.table("user_sessions").delete().eq("user_id", target_id).execute()
     return {"ok": True}
@@ -1729,7 +1583,6 @@ def admin_unban_user(payload: dict, user: dict = Depends(get_current_user)):
     sb.table("users").update({"deleted": False, "banned": False, "banned_reason": None, "banned_until": None}).eq("user_id", target_id).execute()
     return {"ok": True}
 
-# ---------- Stories Moderation ----------
 @api_router.get("/admin/stories")
 def admin_get_stories(user: dict = Depends(get_current_user)):
     if not user.get("is_admin"):
@@ -1746,17 +1599,13 @@ def admin_delete_story(story_id: str, user: dict = Depends(get_current_user)):
     sb.table("stories").delete().eq("story_id", story_id).execute()
     return {"ok": True}
 
-# ---------- User Lookup ----------
 @api_router.get("/admin/users")
 def admin_search_users(query: str, user: dict = Depends(get_current_user)):
     if not user.get("is_admin"):
         raise HTTPException(403, "Admin access required")
-    # Search by email or name (using display_name or name)
     res = sb.table("users").select("user_id,email,name,verified,premium_tier,deleted,banned,tokens,diamonds,last_active,created_at").or_(f"email.ilike.%{query}%,name.ilike.%{query}%").limit(20).execute()
     users = res.data or []
-    # Also search profiles for display_name
     profiles = sb.table("user_profiles").select("user_id,display_name").or_(f"display_name.ilike.%{query}%").limit(20).execute().data or []
-    # Merge
     profile_map = {p["user_id"]: p["display_name"] for p in profiles}
     result = []
     for u in users:
@@ -1764,20 +1613,15 @@ def admin_search_users(query: str, user: dict = Depends(get_current_user)):
         result.append(u)
     return result
 
-# ---------- Stats ----------
 @api_router.get("/admin/stats")
 def admin_stats(user: dict = Depends(get_current_user)):
     if not user.get("is_admin"):
         raise HTTPException(403, "Admin access required")
     total_users = sb.table("users").select("user_id", count="exact").eq("deleted", False).execute().count
-    # New today
     today = datetime.now(timezone.utc).date()
     new_today = sb.table("users").select("user_id", count="exact").gte("created_at", today.isoformat()).execute().count
-    # Active (last 24h)
     active = sb.table("users").select("user_id", count="exact").gte("last_active", (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()).execute().count
-    # Revenue (sum of diamond purchases) – we store amount paid in description but not a numeric column. We'll approximate by counting purchases.
     purchases = sb.table("diamond_purchases").select("item").execute().data or []
-    # Estimate revenue: each purchase corresponds to a package value. We'll just return purchase count.
     total_purchases = len(purchases)
     return {
         "total_users": total_users,
@@ -1786,7 +1630,6 @@ def admin_stats(user: dict = Depends(get_current_user)):
         "diamond_purchases": total_purchases,
     }
 
-# ---------- Announcement ----------
 @api_router.post("/admin/announce")
 def admin_announce(payload: dict, user: dict = Depends(get_current_user)):
     if not user.get("is_admin"):
@@ -1794,22 +1637,18 @@ def admin_announce(payload: dict, user: dict = Depends(get_current_user)):
     message = payload.get("message", "")
     if not message:
         raise HTTPException(400, "Message required")
-
-    # Fetch only non‑deleted users (batch them to avoid huge memory usage)
     users = sb.table("users").select("user_id").eq("deleted", False).execute().data or []
     sent_count = 0
     errors = 0
     for u in users:
         try:
-            # Use the admin's own user_id as the sender, not "system"
             notify_user(u["user_id"], "announcement", message, user["user_id"])
             sent_count += 1
         except Exception as e:
             logger.error(f"Failed to notify {u['user_id']}: {e}")
             errors += 1
-
     return {"ok": True, "sent_to": sent_count, "errors": errors}
-# ---------- Manual Verification ----------
+
 @api_router.post("/admin/verify-user")
 def admin_verify_user(payload: dict, user: dict = Depends(get_current_user)):
     if not user.get("is_admin"):
@@ -1821,12 +1660,10 @@ def admin_verify_user(payload: dict, user: dict = Depends(get_current_user)):
     sb.table("users").update({"verified": verified}).eq("user_id", target_id).execute()
     return {"ok": True}
 
-# ---------- Image Queue (recently updated profiles) ----------
 @api_router.get("/admin/image-queue")
 def admin_image_queue(user: dict = Depends(get_current_user)):
     if not user.get("is_admin"):
         raise HTTPException(403, "Admin access required")
-    # Fetch profiles with images, ordered by updated_at desc
     profiles = sb.table("user_profiles").select("*").not_.is_("profile_image", None).order("updated_at", desc=True).limit(50).execute().data or []
     users = sb.table("users").select("user_id,verified,premium_tier").execute().data or []
     user_map = {u["user_id"]: u for u in users}
@@ -1843,11 +1680,10 @@ def admin_image_queue(user: dict = Depends(get_current_user)):
         })
     return result
 
-# ---------- Admin image deletion ----------
 @api_router.delete("/admin/images/{user_id}/{image_type}/{image_index}")
 def admin_delete_image(
     user_id: str,
-    image_type: str,  # "profile" or "gallery"
+    image_type: str,
     image_index: int,
     admin_user: dict = Depends(get_current_user)
 ):
@@ -1855,11 +1691,9 @@ def admin_delete_image(
         raise HTTPException(403, "Admin access required")
     if image_type not in ("profile", "gallery"):
         raise HTTPException(400, "Image type must be 'profile' or 'gallery'")
-
     profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user_id).maybe_single().execute())
     if not profile:
         raise HTTPException(404, "User not found")
-
     if image_type == "profile":
         image_url = profile.get("profile_image")
         if not image_url:
@@ -1871,7 +1705,7 @@ def admin_delete_image(
             except Exception as e:
                 logger.warning(f"Could not delete profile image {path}: {e}")
         sb.table("user_profiles").update({"profile_image": None}).eq("user_id", user_id).execute()
-    else:  # gallery
+    else:
         gallery = profile.get("gallery_images") or []
         if image_index < 0 or image_index >= len(gallery):
             raise HTTPException(400, "Invalid image index")
@@ -1884,11 +1718,9 @@ def admin_delete_image(
                 logger.warning(f"Could not delete gallery image {path}: {e}")
         del gallery[image_index]
         sb.table("user_profiles").update({"gallery_images": gallery}).eq("user_id", user_id).execute()
-
     return {"ok": True}
 
 def extract_path_from_url(url: str) -> Optional[str]:
-    """Extract bucket path from Supabase storage URL."""
     if not url:
         return None
     prefix = f"{SUPABASE_URL}/storage/v1/object/public/{STORAGE_BUCKET}/"
@@ -1896,57 +1728,43 @@ def extract_path_from_url(url: str) -> Optional[str]:
         return url[len(prefix):]
     return None
 
-
-
 # ---------- Photo & Story reports ----------
-
 @api_router.post("/report-content")
 def report_content(payload: dict, user: dict = Depends(get_current_user)):
     reported_user_id = payload.get("reported_user_id")
     reason = payload.get("reason", "")
     image_index = payload.get("image_index")
     story_id = payload.get("story_id")
-
     if not reported_user_id or not reason:
         raise HTTPException(400, "Missing reported_user_id or reason")
-
     full_reason = reason
     if image_index is not None:
         full_reason += f" (image {image_index})"
     if story_id:
         full_reason += f" (story {story_id})"
-
-    # ---------- THE FIX ----------
     sb.table("user_reports").insert({
-        "report_id": str(uuid.uuid4()),          # ← this was missing
+        "report_id": str(uuid.uuid4()),
         "reporter_id": user["user_id"],
         "reported_user_id": reported_user_id,
         "reason": full_reason,
         "created_at": datetime.utcnow().isoformat()
     }).execute()
-
     notify_user(
         reported_user_id,
         "warning",
         f"Your content has been reported for: {reason}. Our team will review it.",
         user["user_id"]
     )
-
     return {"ok": True}
 
+# ---------- Admin: detailed reports, suspend, delete photo/story ----------
+# (All these endpoints are already present and unchanged in your original file, so I've kept them here for completeness)
 
-
-
-
-# ---------- Admin: get detailed reports ----------
-# ---------- Admin: get detailed reports ----------
 @api_router.get("/admin/reports-detailed")
 def get_detailed_reports(user: dict = Depends(get_current_user)):
     if not user.get("is_admin"):
         raise HTTPException(403, "Admin only")
-
     reports = sb.table("user_reports").select("*").order("created_at", desc=True).execute().data or []
-
     enriched = []
     for r in reports:
         item = dict(r)
@@ -1954,7 +1772,6 @@ def get_detailed_reports(user: dict = Depends(get_current_user)):
         base_reason = reason_full
         image_index = None
         story_id = None
-
         if "(image " in reason_full:
             base_reason = reason_full.split(" (image ")[0]
             try:
@@ -1965,18 +1782,13 @@ def get_detailed_reports(user: dict = Depends(get_current_user)):
             base_reason = reason_full.split(" (story ")[0]
             story_id_part = reason_full.split("(story ")[1].rstrip(")")
             story_id = story_id_part.strip()
-
         item["reason_clean"] = base_reason
         item["type"] = "photo" if image_index is not None else ("story" if story_id else "user")
-
-        # Safe fetching using _maybe
         reporter = _maybe(sb.table("users").select("email,name").eq("user_id", r["reporter_id"]).maybe_single().execute())
         item["reporter_name"] = reporter["name"] or reporter["email"] if reporter else "Unknown"
-
         target = _maybe(sb.table("users").select("email,name").eq("user_id", r["reported_user_id"]).maybe_single().execute())
         item["reported_name"] = target["name"] or target["email"] if target else "Unknown"
         item["reported_email"] = target["email"] if target else ""
-
         if item["type"] == "photo" and image_index is not None:
             profile = _maybe(sb.table("user_profiles").select("profile_image,gallery_images").eq("user_id", r["reported_user_id"]).maybe_single().execute())
             if profile:
@@ -1986,17 +1798,13 @@ def get_detailed_reports(user: dict = Depends(get_current_user)):
                     gallery = profile.get("gallery_images") or []
                     if image_index - 1 < len(gallery):
                         item["image_url"] = gallery[image_index - 1]
-
         if item["type"] == "story" and story_id:
             story = _maybe(sb.table("stories").select("content").eq("story_id", story_id).maybe_single().execute())
             if story:
                 item["story_content"] = story.get("content", "")
-
         enriched.append(item)
-
     return enriched
 
-# ---------- Admin: suspend user ----------
 @api_router.post("/admin/suspend")
 def admin_suspend_user(payload: dict, user: dict = Depends(get_current_user)):
     if not user.get("is_admin"):
@@ -2008,17 +1816,13 @@ def admin_suspend_user(payload: dict, user: dict = Depends(get_current_user)):
     notify_user(target_id, "warning", f"Your account has been suspended for: {reason}. If you believe this is a mistake, please contact support.", user["user_id"])
     return {"ok": True}
 
-
-# ---------- Admin: delete reported photo ----------
 @api_router.delete("/admin/reports/{report_id}/delete-photo")
 def admin_delete_reported_photo(report_id: str, user: dict = Depends(get_current_user)):
     if not user.get("is_admin"):
         raise HTTPException(403, "Admin only")
-
     report = sb.table("user_reports").select("*").eq("report_id", report_id).maybe_single().execute().data
     if not report:
         raise HTTPException(404, "Report not found")
-
     reason = report.get("reason", "")
     image_index = None
     if "(image " in reason:
@@ -2026,7 +1830,6 @@ def admin_delete_reported_photo(report_id: str, user: dict = Depends(get_current
             image_index = int(reason.split("(image ")[1].split(")")[0])
         except:
             raise HTTPException(400, "Invalid image index in report")
-
     target_user_id = report["reported_user_id"]
     profile = sb.table("user_profiles").select("profile_image,gallery_images").eq("user_id", target_user_id).maybe_single().execute().data
     if profile:
@@ -2037,35 +1840,26 @@ def admin_delete_reported_photo(report_id: str, user: dict = Depends(get_current
             if image_index - 1 < len(gallery):
                 del gallery[image_index - 1]
                 sb.table("user_profiles").update({"gallery_images": gallery}).eq("user_id", target_user_id).execute()
-
     sb.table("user_reports").delete().eq("report_id", report_id).execute()
     notify_user(target_user_id, "warning", f"Your photo was removed because it was reported as {reason}. Please follow our guidelines.", user["user_id"])
     return {"ok": True}
 
-
-# ---------- Admin: delete reported story ----------
 @api_router.delete("/admin/reports/{report_id}/delete-story")
 def admin_delete_reported_story(report_id: str, user: dict = Depends(get_current_user)):
     if not user.get("is_admin"):
         raise HTTPException(403, "Admin only")
-
     report = sb.table("user_reports").select("*").eq("report_id", report_id).maybe_single().execute().data
     if not report:
         raise HTTPException(404, "Report not found")
-
     reason = report.get("reason", "")
     story_id = None
     if "(story " in reason:
         story_id = reason.split("(story ")[1].rstrip(")")
-
     if story_id:
         sb.table("stories").delete().eq("story_id", story_id).execute()
-
     sb.table("user_reports").delete().eq("report_id", report_id).execute()
     notify_user(report["reported_user_id"], "warning", f"Your story was removed because it was reported as {reason}.", user["user_id"])
     return {"ok": True}
-
-
 
 # lost child
 @api_router.get("/users/{user_id}/profile")
@@ -2077,6 +1871,7 @@ def get_user_profile(user_id: str):
 
 
 # ===================== GROUPS =====================
+# (Groups endpoints unchanged – included here for completeness)
 
 @api_router.post("/groups")
 def create_group(payload: dict, user: dict = Depends(get_current_user)):
@@ -2084,30 +1879,25 @@ def create_group(payload: dict, user: dict = Depends(get_current_user)):
         raise HTTPException(400, "Only premium users can create groups")
     if user.get("diamonds", 0) < 10:
         raise HTTPException(402, "You need 10 diamonds to create a group")
-
     title = payload.get("title")
     if not title or len(title.strip()) == 0:
         raise HTTPException(400, "Title is required")
     if len(title) > 100:
         raise HTTPException(400, "Title too long (max 100)")
-
     description = payload.get("description", "")
     rules = payload.get("rules", "")
     image = payload.get("image", "")
     join_cost = int(payload.get("join_cost", 0))
     if join_cost < 0:
         raise HTTPException(400, "Join cost cannot be negative")
-
     new_diamonds = user["diamonds"] - 10
     sb.table("users").update({"diamonds": new_diamonds}).eq("user_id", user["user_id"]).execute()
-
     if image and (image.startswith("data:image") or "base64" in image):
         compressed = compress_image(image)
         filename = f"group_{uuid.uuid4().hex[:8]}.webp"
         image_url = upload_image_to_supabase(compressed, user["user_id"], filename)
     else:
         image_url = image or ""
-
     group_id = f"grp_{uuid.uuid4().hex[:12]}"
     now = datetime.now(timezone.utc).isoformat()
     sb.table("groups").insert({
@@ -2121,54 +1911,41 @@ def create_group(payload: dict, user: dict = Depends(get_current_user)):
         "created_at": now,
         "updated_at": now
     }).execute()
-
     sb.table("group_members").insert({
         "group_id": group_id,
         "user_id": user["user_id"],
         "role": "creator",
         "joined_at": now
     }).execute()
-
     return {"ok": True, "group_id": group_id}
-
 
 @api_router.get("/groups")
 def list_groups(user: dict = Depends(get_current_user)):
     groups = sb.table("groups").select("*").execute().data or []
-
     for g in groups:
         members = sb.table("group_members").select("user_id").eq("group_id", g["group_id"]).execute().data or []
         g["member_count"] = len(members)
-
     groups.sort(key=lambda x: x["member_count"], reverse=True)
-
     for g in groups:
         member = _maybe(sb.table("group_members").select("role").eq("group_id", g["group_id"]).eq("user_id", user["user_id"]).maybe_single().execute())
         g["my_role"] = member.get("role") if member else None
-
     return groups
-
 
 @api_router.get("/groups/{group_id}")
 def get_group(group_id: str, user: dict = Depends(get_current_user)):
     group = _maybe(sb.table("groups").select("*").eq("group_id", group_id).maybe_single().execute())
     if not group:
         raise HTTPException(404, "Group not found")
-
     members = sb.table("group_members").select("user_id,role").eq("group_id", group_id).execute().data or []
     for m in members:
         profile = _maybe(sb.table("user_profiles").select("display_name,profile_image").eq("user_id", m["user_id"]).maybe_single().execute())
         m["display_name"] = profile.get("display_name") if profile else "Unknown"
         m["profile_image"] = profile.get("profile_image") if profile else ""
-
     group["members"] = members
-
     bans = sb.table("group_bans").select("*").eq("group_id", group_id).execute().data or []
     group["bans"] = bans
-
     my_member = _maybe(sb.table("group_members").select("role").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute())
     group["my_role"] = my_member.get("role") if my_member else None
-
     ban = _maybe(sb.table("group_bans").select("banned_until").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute())
     group["am_i_banned"] = False
     if ban:
@@ -2177,83 +1954,66 @@ def get_group(group_id: str, user: dict = Depends(get_current_user)):
         else:
             if _parse_dt(ban["banned_until"]) > datetime.now(timezone.utc):
                 group["am_i_banned"] = True
-
     return group
-
 
 @api_router.post("/groups/{group_id}/join")
 def join_group(group_id: str, user: dict = Depends(get_current_user)):
     group = _maybe(sb.table("groups").select("*").eq("group_id", group_id).maybe_single().execute())
     if not group:
         raise HTTPException(404, "Group not found")
-
     existing = _maybe(sb.table("group_members").select("role").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute())
     if existing:
         raise HTTPException(400, "Already a member")
-
     ban = _maybe(sb.table("group_bans").select("banned_until").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute())
     if ban:
         if ban.get("banned_until") is None or _parse_dt(ban["banned_until"]) > datetime.now(timezone.utc):
             raise HTTPException(403, "You are banned from this group")
-
     join_cost = group.get("join_cost", 0)
     if join_cost > 0:
         if user.get("diamonds", 0) < join_cost:
             raise HTTPException(402, f"You need {join_cost} diamonds to join this group")
         new_diamonds = user["diamonds"] - join_cost
         sb.table("users").update({"diamonds": new_diamonds}).eq("user_id", user["user_id"]).execute()
-
     sb.table("group_members").insert({
         "group_id": group_id,
         "user_id": user["user_id"],
         "role": "member",
         "joined_at": datetime.now(timezone.utc).isoformat()
     }).execute()
-
     notify_user(group["creator_id"], "group_join", f"{user.get('name', 'Someone')} joined your group {group['title']}", user["user_id"])
     return {"ok": True}
-
 
 @api_router.delete("/groups/{group_id}/members/{user_id}")
 def remove_member(group_id: str, user_id: str, user: dict = Depends(get_current_user)):
     group = _maybe(sb.table("groups").select("creator_id").eq("group_id", group_id).maybe_single().execute())
     if not group:
         raise HTTPException(404)
-
     requester = _maybe(sb.table("group_members").select("role").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute())
     if not requester:
         raise HTTPException(403, "You are not a member of this group")
-
     if requester.get("role") == "creator" and user_id != user["user_id"]:
         sb.table("group_members").delete().eq("group_id", group_id).eq("user_id", user_id).execute()
         return {"ok": True}
-
     if requester.get("role") == "moderator":
         target = _maybe(sb.table("group_members").select("role").eq("group_id", group_id).eq("user_id", user_id).maybe_single().execute())
         if target and target.get("role") not in ("creator", "moderator"):
             sb.table("group_members").delete().eq("group_id", group_id).eq("user_id", user_id).execute()
             return {"ok": True}
-
     if user_id == user["user_id"]:
         sb.table("group_members").delete().eq("group_id", group_id).eq("user_id", user["user_id"]).execute()
         return {"ok": True}
-
     raise HTTPException(403, "You don't have permission to remove this member")
-
 
 @api_router.put("/groups/{group_id}/members/{user_id}/role")
 def change_member_role(group_id: str, user_id: str, payload: dict, user: dict = Depends(get_current_user)):
     new_role = payload.get("role")
     if new_role not in ("moderator", "member"):
         raise HTTPException(400, "Invalid role")
-
     group = _maybe(sb.table("groups").select("creator_id").eq("group_id", group_id).maybe_single().execute())
     if not group or group.get("creator_id") != user["user_id"]:
         raise HTTPException(403, "Only the group creator can change roles")
-
     sb.table("group_members").update({"role": new_role}).eq("group_id", group_id).eq("user_id", user_id).execute()
     return {"ok": True}
-
 
 @api_router.post("/groups/{group_id}/messages")
 def send_group_message(group_id: str, payload: dict, user: dict = Depends(get_current_user)):
@@ -2262,21 +2022,17 @@ def send_group_message(group_id: str, payload: dict, user: dict = Depends(get_cu
         raise HTTPException(400)
     if contains_profanity(content):
         raise HTTPException(400, "Message contains inappropriate language")
-
     member = _maybe(sb.table("group_members").select("role").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute())
     if not member:
         raise HTTPException(403, "You are not a member")
-
     ban = _maybe(sb.table("group_bans").select("banned_until").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute())
     if ban and (ban.get("banned_until") is None or _parse_dt(ban["banned_until"]) > datetime.now(timezone.utc)):
         raise HTTPException(403, "You are banned")
-
     if not is_premium(user):
         msgs = sb.table("group_messages").select("message_id").eq("group_id", group_id).eq("sender_id", user["user_id"]).execute().data or []
         msg_count = len(msgs)
         if msg_count >= 2:
             require_token(user, 1)
-
     message_id = f"gm_{uuid.uuid4().hex[:12]}"
     sb.table("group_messages").insert({
         "message_id": message_id,
@@ -2285,61 +2041,48 @@ def send_group_message(group_id: str, payload: dict, user: dict = Depends(get_cu
         "content": content.strip(),
         "created_at": datetime.now(timezone.utc).isoformat()
     }).execute()
-
     return {"ok": True, "message_id": message_id}
-
 
 @api_router.get("/groups/{group_id}/messages")
 def get_group_messages(group_id: str, limit: int = 50, before: Optional[str] = None, user: dict = Depends(get_current_user)):
     member = _maybe(sb.table("group_members").select("role").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute())
     if not member:
         raise HTTPException(403)
-
     query = sb.table("group_messages").select("*").eq("group_id", group_id).order("created_at", desc=True).limit(limit)
     if before:
         query = query.lt("created_at", before)
     msgs = query.execute().data or []
     msgs.reverse()
-
     for msg in msgs:
         sender = _maybe(sb.table("users").select("name").eq("user_id", msg["sender_id"]).maybe_single().execute())
         msg["sender_name"] = sender.get("name") if sender else "Unknown"
-
     return msgs
-
 
 @api_router.delete("/groups/{group_id}/messages/{message_id}")
 def delete_group_message(group_id: str, message_id: str, user: dict = Depends(get_current_user)):
     msg = _maybe(sb.table("group_messages").select("*").eq("message_id", message_id).eq("group_id", group_id).maybe_single().execute())
     if not msg:
         raise HTTPException(404)
-
     if msg.get("sender_id") == user["user_id"]:
         sb.table("group_messages").update({"deleted": True}).eq("message_id", message_id).execute()
         return {"ok": True}
-
     member = _maybe(sb.table("group_members").select("role").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute())
     if not member or member.get("role") not in ("creator", "moderator"):
         raise HTTPException(403, "Only moderators or creator can delete others' messages")
-
     sb.table("group_messages").update({"deleted": True}).eq("message_id", message_id).execute()
     return {"ok": True}
-
 
 @api_router.post("/groups/{group_id}/bans")
 def ban_user(group_id: str, payload: dict, user: dict = Depends(get_current_user)):
     group = _maybe(sb.table("groups").select("creator_id").eq("group_id", group_id).maybe_single().execute())
     if not group or group.get("creator_id") != user["user_id"]:
         raise HTTPException(403, "Only the group creator can ban users")
-
     target_id = payload.get("user_id")
     duration_hours = payload.get("duration_hours")
     reason = payload.get("reason", "")
-
     banned_until = None
     if duration_hours:
         banned_until = datetime.now(timezone.utc) + timedelta(hours=duration_hours)
-
     ban_id = f"ban_{uuid.uuid4().hex[:12]}"
     sb.table("group_bans").insert({
         "ban_id": ban_id,
@@ -2350,19 +2093,15 @@ def ban_user(group_id: str, payload: dict, user: dict = Depends(get_current_user
         "banned_until": banned_until.isoformat() if banned_until else None,
         "created_at": datetime.now(timezone.utc).isoformat()
     }).execute()
-
     sb.table("group_members").delete().eq("group_id", group_id).eq("user_id", target_id).execute()
-
     notify_user(target_id, "group_ban", f"You have been banned from {group['title']}: {reason}", user["user_id"])
     return {"ok": True}
-
 
 @api_router.put("/groups/{group_id}")
 def edit_group(group_id: str, payload: dict, user: dict = Depends(get_current_user)):
     group = _maybe(sb.table("groups").select("creator_id").eq("group_id", group_id).maybe_single().execute())
     if not group or group.get("creator_id") != user["user_id"]:
         raise HTTPException(403, "Only the creator can edit the group")
-
     updates = {}
     for field in ["title", "description", "rules", "join_cost"]:
         if field in payload:
@@ -2377,7 +2116,6 @@ def edit_group(group_id: str, payload: dict, user: dict = Depends(get_current_us
                 updates["join_cost"] = cost
             else:
                 updates[field] = payload[field]
-
     if "image" in payload:
         img = payload["image"]
         if img and (img.startswith("data:image") or "base64" in img):
@@ -2386,15 +2124,12 @@ def edit_group(group_id: str, payload: dict, user: dict = Depends(get_current_us
             updates["image"] = upload_image_to_supabase(compressed, user["user_id"], filename)
         else:
             updates["image"] = img or ""
-
     if updates:
         updates["updated_at"] = datetime.now(timezone.utc).isoformat()
         sb.table("groups").update(updates).eq("group_id", group_id).execute()
-
     return {"ok": True}
 
 # ---------- Comments on group messages ----------
-
 @api_router.post("/groups/{group_id}/messages/{message_id}/comments")
 def create_group_comment(
     group_id: str,
@@ -2403,44 +2138,35 @@ def create_group_comment(
     user: dict = Depends(get_current_user)
 ):
     content = payload.get("content", "")
-    parent_id = payload.get("parent_id")   # optional, for replies to replies
-
+    parent_id = payload.get("parent_id")
     if not content.strip():
         raise HTTPException(400, "Comment cannot be empty")
     if contains_profanity(content):
         raise HTTPException(400, "Comment contains inappropriate language")
-
-    # Verify user is a member and not banned
     member = _maybe(sb.table("group_members").select("role")
         .eq("group_id", group_id)
         .eq("user_id", user["user_id"])
         .maybe_single().execute())
     if not member:
         raise HTTPException(403, "You must be a member to comment")
-
     ban = _maybe(sb.table("group_bans").select("banned_until")
         .eq("group_id", group_id)
         .eq("user_id", user["user_id"])
         .maybe_single().execute())
     if ban and (ban.get("banned_until") is None or _parse_dt(ban["banned_until"]) > datetime.now(timezone.utc)):
         raise HTTPException(403, "You are banned")
-
-    # Verify the message exists in this group
     msg = _maybe(sb.table("group_messages").select("message_id")
         .eq("message_id", message_id)
         .eq("group_id", group_id)
         .maybe_single().execute())
     if not msg:
         raise HTTPException(404, "Message not found")
-
-    # If parent_id is given, verify it exists
     if parent_id:
         parent = _maybe(sb.table("group_message_comments").select("comment_id")
             .eq("comment_id", parent_id)
             .maybe_single().execute())
         if not parent:
             raise HTTPException(404, "Parent comment not found")
-
     comment_id = f"gmc_{uuid.uuid4().hex[:12]}"
     now = datetime.now(timezone.utc).isoformat()
     sb.table("group_message_comments").insert({
@@ -2451,8 +2177,6 @@ def create_group_comment(
         "parent_id": parent_id,
         "created_at": now
     }).execute()
-
-    # Notify the message author (optional)
     original_author = _maybe(sb.table("group_messages").select("sender_id")
         .eq("message_id", message_id).maybe_single().execute())
     if original_author and original_author["sender_id"] != user["user_id"]:
@@ -2462,9 +2186,7 @@ def create_group_comment(
             f"Someone commented on your message in group {group_id}",
             user["user_id"]
         )
-
     return {"ok": True, "comment_id": comment_id}
-
 
 @api_router.get("/groups/{group_id}/messages/{message_id}/comments")
 def get_group_comments(
@@ -2472,30 +2194,23 @@ def get_group_comments(
     message_id: str,
     user: dict = Depends(get_current_user)
 ):
-    # Verify membership
     member = _maybe(sb.table("group_members").select("role")
         .eq("group_id", group_id)
         .eq("user_id", user["user_id"])
         .maybe_single().execute())
     if not member:
         raise HTTPException(403)
-
     comments = sb.table("group_message_comments").select("*")\
         .eq("message_id", message_id)\
         .order("created_at")\
         .execute().data or []
-
-    # Attach user names
     for c in comments:
         profile = _maybe(sb.table("users").select("name")
             .eq("user_id", c["user_id"])
             .maybe_single().execute())
         c["author_name"] = profile.get("name") if profile else "Unknown"
-
-    # Build tree
-    tree = build_comment_tree(comments)   # reuse the same helper from stories
+    tree = build_comment_tree(comments)
     return tree
-
 
 @api_router.delete("/groups/{group_id}/messages/{message_id}/comments/{comment_id}")
 def delete_group_comment(
@@ -2504,17 +2219,14 @@ def delete_group_comment(
     comment_id: str,
     user: dict = Depends(get_current_user)
 ):
-    # Fetch comment
     comment = _maybe(sb.table("group_message_comments").select("*")
         .eq("comment_id", comment_id)
         .eq("message_id", message_id)
         .maybe_single().execute())
     if not comment:
         raise HTTPException(404, "Comment not found")
-
-    # Permission: author, group creator, or moderator
     if comment["user_id"] == user["user_id"]:
-        pass  # ok
+        pass
     else:
         member = _maybe(sb.table("group_members").select("role")
             .eq("group_id", group_id)
@@ -2522,37 +2234,24 @@ def delete_group_comment(
             .maybe_single().execute())
         if not member or member.get("role") not in ("creator", "moderator"):
             raise HTTPException(403, "You cannot delete this comment")
-
-    # Delete (cascade will remove replies if FK is set)
     sb.table("group_message_comments").delete().eq("comment_id", comment_id).execute()
     return {"ok": True}
 
 
 # ===================== EMAIL / PASSWORD AUTH =====================
-# ===================== EMAIL / PASSWORD AUTH =====================
-# ===================== EMAIL / PASSWORD AUTH =====================
-# ===================== EMAIL / PASSWORD AUTH =====================
 
-# ---------- Email helper (Brevo HTTP API) ----------
 def send_email(to_email: str, subject: str, body: str):
-    """
-    Send a transactional email via Brevo's HTTP REST API (port 443).
-    This avoids the SMTP block on Render's free tier.
-    """
     brevo_api_key = os.environ.get("BREVO_API_KEY")
     smtp_from = os.environ.get("SMTP_FROM", "noreply@havenpositive.online")
-
     if not brevo_api_key:
         logger.info(f"Brevo API key not configured – email not sent. To={to_email}, Subject={subject}")
         return
-
     payload = {
         "sender": {"name": "Haven", "email": smtp_from},
         "to": [{"email": to_email}],
         "subject": subject,
         "htmlContent": body,
     }
-
     try:
         resp = httpx.post(
             "https://api.brevo.com/v3/smtp/email",
@@ -2572,20 +2271,15 @@ def send_email(to_email: str, subject: str, body: str):
         logger.error(f"Failed to send email to {to_email}: {e}")
         raise
 
-
-# ---------- Signup ----------
 @api_router.post("/auth/signup")
 def signup_email(payload: dict, request: Request, response: Response):
     email = payload.get("email", "").strip().lower()
     password = payload.get("password", "")
     name = payload.get("name", email.split("@")[0])
-
     if not email or not password:
         raise HTTPException(400, "Email and password required")
     if len(password) < 6:
         raise HTTPException(400, "Password must be at least 6 characters")
-
-    # Check if email already exists
     existing = _maybe(
         sb.table("users").select("user_id,deleted").eq("email", email).maybe_single().execute()
     )
@@ -2593,15 +2287,12 @@ def signup_email(payload: dict, request: Request, response: Response):
         if existing.get("deleted"):
             raise HTTPException(400, "An account with this email was deleted. Contact support.")
         raise HTTPException(400, "An account with this email already exists")
-
     raw_password = password[:72].encode("utf-8")
     password_hash = bcrypt.hashpw(raw_password, bcrypt.gensalt()).decode()
-
     user_id = f"user_{uuid.uuid4().hex[:12]}"
     now = datetime.now(timezone.utc).isoformat()
     verification_token = uuid.uuid4().hex
     verification_expires = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
-
     sb.table("users").insert({
         "user_id": user_id, "email": email, "name": name,
         "password_hash": password_hash, "email_verified": False,
@@ -2610,8 +2301,6 @@ def signup_email(payload: dict, request: Request, response: Response):
         "created_at": now, "last_active": now,
         "tokens": 100, "diamonds": 5, "verified": False,
     }).execute()
-
-    # ---- Send verification email via Brevo HTTP API (in background) ----
     verify_link = f"https://jwdate-e6fe5.web.app/verify-email?token={verification_token}"
     body = f"""
     <h2>Welcome to Haven!</h2>
@@ -2619,71 +2308,53 @@ def signup_email(payload: dict, request: Request, response: Response):
     <a href="{verify_link}">{verify_link}</a>
     <p>This link expires in 24 hours.</p>
     """
-
-    # ALWAYS log the link as a fallback
     logger.info("=" * 60)
     logger.info("VERIFICATION LINK: " + verify_link)
     logger.info("=" * 60)
-
-    # Send email in background thread so the request returns instantly
     def send_verification():
         try:
             send_email(email, "Verify your Haven account", body)
         except Exception as e:
             logger.error(f"Failed to send verification email: {e}")
-
     threading.Thread(target=send_verification).start()
-
     return {"ok": True, "message": "Account created! Please check your email to verify."}
 
-
-# ---------- Login ----------
 @api_router.post("/auth/login")
 def login_email(payload: dict, request: Request, response: Response):
     email = payload.get("email", "").strip().lower()
     password = payload.get("password", "")
-
     if not email or not password:
         raise HTTPException(400, "Email and password required")
-
     user = _maybe(
         sb.table("users").select("*").eq("email", email).eq("deleted", False).maybe_single().execute()
     )
     if not user or not user.get("password_hash"):
         raise HTTPException(401, "Invalid email or password")
-
     try:
         if not bcrypt.checkpw(password[:72].encode("utf-8"), user["password_hash"].encode()):
             raise HTTPException(401, "Invalid email or password")
     except Exception:
         raise HTTPException(401, "Invalid email or password")
-
     if not user.get("email_verified"):
         raise HTTPException(403, "Please verify your email before logging in. Check your inbox.")
-
     session_token = f"session_{uuid.uuid4().hex[:32]}"
     expires_at = datetime.now(timezone.utc) + timedelta(days=7)
     sb.table("user_sessions").upsert({
         "session_token": session_token, "user_id": user["user_id"],
         "expires_at": expires_at.isoformat(), "created_at": datetime.now(timezone.utc).isoformat()
     }).execute()
-
     sb.table("users").update({"last_active": datetime.now(timezone.utc).isoformat()}).eq("user_id", user["user_id"]).execute()
-
     response.set_cookie(
         key="session_token", value=session_token, httponly=True,
         secure=request.url.scheme == "https", samesite="lax", path="/", max_age=7*24*60*60,
     )
     return {"ok": True, "user_id": user["user_id"], "token": session_token}
 
-
-# ---------- Verify Email ----------
 @api_router.post("/auth/verify-email")
 def verify_email(payload: dict):
     token = payload.get("token", "")
     if not token:
         raise HTTPException(400, "Missing verification token")
-
     user = _maybe(sb.table("users").select("*").eq("verification_token", token).maybe_single().execute())
     if not user:
         raise HTTPException(400, "Invalid or expired token")
@@ -2691,31 +2362,24 @@ def verify_email(payload: dict):
         return {"ok": True, "message": "Email already verified"}
     if _parse_dt(user["verification_token_expires"]) < datetime.now(timezone.utc):
         raise HTTPException(400, "Verification token has expired. Please sign up again.")
-
     sb.table("users").update({
         "email_verified": True, "verification_token": None, "verification_token_expires": None
     }).eq("user_id", user["user_id"]).execute()
-
     return {"ok": True, "message": "Email verified! You can now log in."}
 
-
-# ---------- Forgot Password ----------
 @api_router.post("/auth/forgot-password")
 def forgot_password(payload: dict):
     email = payload.get("email", "").strip().lower()
     if not email:
         raise HTTPException(400, "Email required")
-
     user = _maybe(sb.table("users").select("*").eq("email", email).eq("deleted", False).maybe_single().execute())
     if not user:
         return {"ok": True, "message": "If that email is registered, you'll receive a password reset link."}
-
     reset_token = uuid.uuid4().hex
     reset_expires = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
     sb.table("users").update({
         "reset_token": reset_token, "reset_token_expires": reset_expires
     }).eq("user_id", user["user_id"]).execute()
-
     reset_link = f"https://jwdate-e6fe5.web.app/reset-password?token={reset_token}"
     body = f"""
     <h2>Password Reset</h2>
@@ -2724,16 +2388,12 @@ def forgot_password(payload: dict):
     <p>This link expires in 1 hour.</p>
     """
     logger.info("PASSWORD RESET LINK: " + reset_link)
-
     def send_reset():
         try: send_email(email, "Reset your Haven password", body)
         except Exception as e: logger.error(f"Failed to send password reset email: {e}")
     threading.Thread(target=send_reset).start()
-
     return {"ok": True, "message": "If that email is registered, you'll receive a password reset link."}
 
-
-# ---------- Reset Password ----------
 @api_router.post("/auth/reset-password")
 def reset_password(payload: dict):
     token = payload.get("token", "")
@@ -2742,21 +2402,17 @@ def reset_password(payload: dict):
         raise HTTPException(400, "Token and new password required")
     if len(new_password) < 6:
         raise HTTPException(400, "Password must be at least 6 characters")
-
     user = _maybe(sb.table("users").select("*").eq("reset_token", token).maybe_single().execute())
     if not user:
         raise HTTPException(400, "Invalid or expired token")
     if _parse_dt(user["reset_token_expires"]) < datetime.now(timezone.utc):
         raise HTTPException(400, "Reset token has expired")
-
     raw_password = new_password[:72].encode("utf-8")
     new_hash = bcrypt.hashpw(raw_password, bcrypt.gensalt()).decode()
     sb.table("users").update({
         "password_hash": new_hash, "reset_token": None, "reset_token_expires": None
     }).eq("user_id", user["user_id"]).execute()
-
     return {"ok": True, "message": "Password reset successfully. You can now log in."}
-
 
 # ---------- Google Play Purchase Verification ----------
 import google.auth
@@ -2768,7 +2424,6 @@ def verify_google_purchase(payload: dict, user: dict = Depends(get_current_user)
     purchase_token = payload.get("purchase_token")
     if not product_id or not purchase_token:
         raise HTTPException(400, "Missing product_id or purchase_token")
-
     diamond_map = {
         "diamonds_52": 52,
         "diamonds_120": 120,
@@ -2778,12 +2433,10 @@ def verify_google_purchase(payload: dict, user: dict = Depends(get_current_user)
     diamonds = diamond_map.get(product_id)
     if not diamonds:
         raise HTTPException(400, "Invalid product_id")
-
     try:
         creds_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
         if not creds_json:
             raise HTTPException(500, "Service account not configured")
-
         from google.oauth2 import service_account
         from googleapiclient.discovery import build
         credentials = service_account.Credentials.from_service_account_info(
@@ -2796,7 +2449,6 @@ def verify_google_purchase(payload: dict, user: dict = Depends(get_current_user)
             productId=product_id,
             token=purchase_token,
         ).execute()
-
         if result.get("purchaseState") == 0:
             new_diamonds = user.get("diamonds", 0) + diamonds
             sb.table("users").update({"diamonds": new_diamonds}).eq("user_id", user["user_id"]).execute()
@@ -2820,5 +2472,3 @@ app.include_router(api_router)
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT",8000)))
-    
-    
