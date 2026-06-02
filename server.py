@@ -245,6 +245,8 @@ class ProfileUpdatePayload(BaseModel):
     lock_all_images: Optional[bool] = None
     visible_to_same_identity: Optional[bool] = None
     visible_identity_ids: Optional[List[str]] = None
+    show_to_same_identity: Optional[bool] = None          # NEW
+    show_identity_ids: Optional[List[str]] = None         # NEW
 
 class CreateStoryPayload(BaseModel):
     content: str; category: str; title: Optional[str] = ""
@@ -267,6 +269,8 @@ class CreateIdentityPayload(BaseModel):
 class IdentityVisibilityPayload(BaseModel):
     visible_to_same_identity: Optional[bool] = None
     visible_identity_ids: Optional[List[str]] = None
+    show_to_same_identity: Optional[bool] = None          # NEW
+    show_identity_ids: Optional[List[str]] = None         # NEW
 
 
 # ---------- Auth ----------
@@ -576,6 +580,19 @@ def update_identity_visibility(payload: IdentityVisibilityPayload, user: dict = 
                 if id not in claimed_ids:
                     raise HTTPException(400, f"You have not claimed identity {id}")
         updates["visible_identity_ids"] = payload.visible_identity_ids
+
+    # NEW: handle show fields
+    if payload.show_to_same_identity is not None:
+        updates["show_to_same_identity"] = payload.show_to_same_identity
+    if payload.show_identity_ids is not None:
+        if payload.show_identity_ids:
+            user_claims = sb.table("user_identity_claims").select("identity_id").eq("user_id", user["user_id"]).in_("identity_id", payload.show_identity_ids).execute().data or []
+            claimed_ids = {c["identity_id"] for c in user_claims}
+            for id in payload.show_identity_ids:
+                if id not in claimed_ids:
+                    raise HTTPException(400, f"You have not claimed identity {id}")
+        updates["show_identity_ids"] = payload.show_identity_ids
+
     if not updates:
         raise HTTPException(400, "Nothing to update")
     sb.table("user_profiles").update(updates).eq("user_id", user["user_id"]).execute()
@@ -837,7 +854,9 @@ def get_profile(user: dict) -> dict:
             "verified": False, "premium_tier": None,
             "visible_to": "all", "pref_sexual_orientation": "", "lock_all_images": False,
             "visible_to_same_identity": False,
-            "visible_identity_ids": []
+            "visible_identity_ids": [],
+            "show_to_same_identity": False,
+            "show_identity_ids": []
         }
     lat = profile.get("gps_latitude"); lon = profile.get("gps_longitude")
     country = profile.get("country") if lat is not None else None
@@ -872,6 +891,8 @@ def get_profile(user: dict) -> dict:
         "lock_all_images": profile.get("lock_all_images", False),
         "visible_to_same_identity": profile.get("visible_to_same_identity", False),
         "visible_identity_ids": profile.get("visible_identity_ids") or [],
+        "show_to_same_identity": profile.get("show_to_same_identity", False),
+        "show_identity_ids": profile.get("show_identity_ids") or [],
         "gps_latitude": lat, "gps_longitude": lon,
         "gps_verified_at": profile.get("gps_verified_at"),
         "location_source": profile.get("location_source", "none"),
@@ -952,8 +973,8 @@ def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_curre
         "pref_max_distance", "pref_sexual_orientation",
         "hide_from_min_age", "hide_from_max_age",
         "visible_to", "lock_all_images",
-        "visible_to_same_identity",
-        "visible_identity_ids"
+        "visible_to_same_identity", "visible_identity_ids",
+        "show_to_same_identity", "show_identity_ids"   # NEW
     ]
     for field in all_fields:
         value = getattr(payload, field, None)
@@ -1052,7 +1073,7 @@ def get_discover_profiles(
     for mid in matched_ids:
         query = query.neq("user_id", mid)
 
-    # ---------- IDENTITY VISIBILITY FILTER (REFINED) ----------
+    # ---------- IDENTITY VISIBILITY FILTER (who the viewer sees) ----------
     identity_vis = viewer_profile.get("visible_to_same_identity", False)
     visible_ids = viewer_profile.get("visible_identity_ids") or []
 
@@ -1095,6 +1116,10 @@ def get_discover_profiles(
     users_data = sb.table("users").select("user_id,verified,premium_tier,last_active").in_("user_id", user_ids).execute().data or []
     user_status = {u["user_id"]: u for u in users_data}
 
+    # ---- NEW: Filter out profiles where the profile owner has "who can see me" restrictions ----
+    viewer_claims = sb.table("user_identity_claims").select("identity_id").eq("user_id", user["user_id"]).execute().data or []
+    viewer_identity_ids = [c["identity_id"] for c in viewer_claims]  # identities the viewer holds
+
     filtered = []
     for p in profiles:
         if p.get("profile_hidden"): continue
@@ -1103,6 +1128,19 @@ def get_discover_profiles(
         if p_lat is not None and p_lon is not None:
             distance = haversine(my_lat, my_lon, p_lat, p_lon)
             if pref_max_distance and distance > pref_max_distance: continue
+
+        # Check if this profile's owner restricted who can see them
+        if p.get("show_to_same_identity"):
+            show_ids = p.get("show_identity_ids") or []
+            if show_ids:
+                # Viewer must have at least one of these exact identities
+                if not any(id in show_ids for id in viewer_identity_ids):
+                    continue  # viewer doesn't have any of the required identities, hide this profile
+            else:
+                # Viewer must share at least one identity with the profile owner
+                if not viewer_identity_ids:
+                    continue  # viewer has no identities, so hide
+
         p["distance_km"] = round(distance, 1) if distance is not None else None
         status = user_status.get(p["user_id"], {})
         p["verified"] = status.get("verified", False)
@@ -1768,8 +1806,6 @@ def report_content(payload: dict, user: dict = Depends(get_current_user)):
     return {"ok": True}
 
 # ---------- Admin: detailed reports, suspend, delete photo/story ----------
-# (All these endpoints are already present and unchanged in your original file, so I've kept them here for completeness)
-
 @api_router.get("/admin/reports-detailed")
 def get_detailed_reports(user: dict = Depends(get_current_user)):
     if not user.get("is_admin"):
@@ -1881,8 +1917,6 @@ def get_user_profile(user_id: str):
 
 
 # ===================== GROUPS =====================
-# (Groups endpoints unchanged – included here for completeness)
-
 @api_router.post("/groups")
 def create_group(payload: dict, user: dict = Depends(get_current_user)):
     if not is_premium(user):
