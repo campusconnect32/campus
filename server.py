@@ -33,8 +33,8 @@ logger = logging.getLogger(__name__)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://campusconnect-app-32.web.app/",
-        "https://campusconnect-app-32.firebaseapp.com/",
+        "https://campusconnect-app-32.web.app",
+        "https://campusconnect-app-32.firebaseapp.com",
         "http://localhost:3000",
     ],
     allow_credentials=True,
