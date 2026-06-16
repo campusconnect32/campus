@@ -12,6 +12,7 @@ from functools import lru_cache
 from PIL import Image
 import io
 import threading
+from collections import defaultdict
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -736,6 +737,32 @@ def list_tutors(search: Optional[str] = None):
     if search:
         query = query.ilike("course_code", f"%{search}%")
     tutors = query.execute().data or []
+
+    # Bulk compute average ratings
+    if tutors:
+        tutor_ids = [t["tutor_id"] for t in tutors]
+        ratings = sb.table("tutor_reviews") \
+            .select("tutor_id, rating") \
+            .in_("tutor_id", tutor_ids) \
+            .execute().data or []
+
+        rating_sums = defaultdict(int)
+        rating_counts = defaultdict(int)
+        for r in ratings:
+            if r["rating"] > 0:
+                rating_sums[r["tutor_id"]] += r["rating"]
+                rating_counts[r["tutor_id"]] += 1
+
+        for t in tutors:
+            tid = t["tutor_id"]
+            cnt = rating_counts[tid]
+            t["average_rating"] = round(rating_sums[tid] / cnt, 1) if cnt else 0
+            t["rating_count"] = cnt
+    else:
+        for t in tutors:
+            t["average_rating"] = 0
+            t["rating_count"] = 0
+
     return tutors
 
 @api_router.get("/tutors/{tutor_id}")
@@ -798,7 +825,6 @@ def create_tutor_review(tutor_id: str, payload: TutorReviewPayload, user: dict =
     rating = payload.rating
     if rating > 0 and (rating < 1 or rating > 5):
         raise HTTPException(400, "Rating must be between 1 and 5 if provided")
-    # If rating == 0, it's just a chat message
     review_id = f"rev_{uuid.uuid4().hex[:12]}"
     now = datetime.now(timezone.utc).isoformat()
     sb.table("tutor_reviews").insert({
