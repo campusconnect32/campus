@@ -243,6 +243,9 @@ class MarketItemUpdatePayload(BaseModel):
     category: Optional[str] = None
     image: Optional[str] = None
 
+class MarketMessagePayload(BaseModel):
+    content: str
+
 # ---------- Auth ----------
 async def get_current_user(
     request: Request,
@@ -965,6 +968,22 @@ def list_market_items(category: Optional[str] = None):
     if category:
         query = query.eq("category", category)
     items = query.execute().data or []
+
+    # --- Add seller info from user_profiles ---
+    if items:
+        seller_ids = list({item["user_id"] for item in items})
+        profiles = sb.table("user_profiles") \
+            .select("user_id, display_name, phone_number, country, city") \
+            .in_("user_id", seller_ids) \
+            .execute().data or []
+        profile_map = {p["user_id"]: p for p in profiles}
+        for item in items:
+            p = profile_map.get(item["user_id"], {})
+            item["seller_name"] = p.get("display_name") or "Unknown"
+            item["seller_phone"] = p.get("phone_number") or ""
+            item["seller_country"] = p.get("country") or ""
+            item["seller_city"] = p.get("city") or ""
+
     return items
 
 @api_router.get("/marketplace/items/{item_id}")
@@ -1015,6 +1034,46 @@ def my_market_items_count(user: dict = Depends(get_current_user)):
     count = res.count if hasattr(res, 'count') else 0
     return {"count": count}
 
+# ---------- Marketplace Private Chat ----------
+@api_router.post("/marketplace/items/{item_id}/messages")
+def send_market_message(item_id: str, payload: MarketMessagePayload, user: dict = Depends(get_current_user)):
+    item = _maybe(sb.table("marketplace_items").select("*").eq("item_id", item_id).maybe_single().execute())
+    if not item:
+        raise HTTPException(404, "Item not found")
+    receiver_id = item["user_id"]
+    if receiver_id == user["user_id"]:
+        raise HTTPException(400, "You cannot message yourself")
+
+    message_id = f"mmsg_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+    sb.table("marketplace_messages").insert({
+        "message_id": message_id,
+        "item_id": item_id,
+        "sender_id": user["user_id"],
+        "receiver_id": receiver_id,
+        "content": payload.content.strip(),
+        "created_at": now
+    }).execute()
+    return {"ok": True, "message_id": message_id}
+
+@api_router.get("/marketplace/items/{item_id}/messages")
+def get_market_messages(item_id: str, user: dict = Depends(get_current_user)):
+    messages = sb.table("marketplace_messages")\
+        .select("*")\
+        .eq("item_id", item_id)\
+        .or_(f"sender_id.eq.{user['user_id']},receiver_id.eq.{user['user_id']}")\
+        .order("created_at", desc=False)\
+        .execute().data or []
+
+    # Enrich with sender's display name and profile picture
+    sender_ids = list({m["sender_id"] for m in messages})
+    profiles = sb.table("user_profiles").select("user_id, display_name, profile_image").in_("user_id", sender_ids).execute().data or []
+    pmap = {p["user_id"]: p for p in profiles}
+    for m in messages:
+        p = pmap.get(m["sender_id"], {})
+        m["sender_name"] = p.get("display_name") or "Unknown"
+        m["sender_picture"] = p.get("profile_image") or ""
+    return messages
 
 # ---------- Mount router ----------
 app.include_router(api_router)
