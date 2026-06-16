@@ -193,10 +193,10 @@ class GoogleAuthPayload(BaseModel):
 class ProfileSetupPayload(BaseModel):
     date_of_birth: str
     display_name: Optional[str] = ""
-    gender: str = ""          # required by validation
-    year_of_study: str = ""   # required
-    course: str = ""          # required
-    campus: str = ""          # required
+    gender: str = ""
+    year_of_study: str = ""
+    course: str = ""
+    campus: str = ""
     profile_image: Optional[str] = ""
     gallery_images: Optional[List[str]] = []
 
@@ -209,6 +209,13 @@ class ProfileUpdatePayload(BaseModel):
     campus: Optional[str] = None
     profile_image: Optional[str] = None
     gallery_images: Optional[List[str]] = None
+
+class TutorCreatePayload(BaseModel):
+    title: str
+    course_name: str
+    course_code: str
+    price_range: str
+    image: Optional[str] = ""
 
 # ---------- Auth ----------
 async def get_current_user(
@@ -596,7 +603,6 @@ def get_profile(user: dict) -> dict:
 
 @api_router.post("/profile/setup")
 async def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current_user)):
-    # Validate compulsory fields – reject empty or whitespace-only strings
     if not payload.gender.strip() or not payload.year_of_study.strip() or not payload.course.strip() or not payload.campus.strip():
         raise HTTPException(400, "Gender, year of study, course, and campus are required")
 
@@ -685,6 +691,58 @@ async def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get
 @api_router.get("/profile")
 def get_my_profile(user: dict = Depends(get_current_user)):
     return get_profile(user)
+
+# ---------- Tutors ----------
+@api_router.post("/tutors")
+async def create_tutor(payload: TutorCreatePayload, user: dict = Depends(get_current_user)):
+    if not payload.title.strip() or not payload.course_name.strip() or not payload.course_code.strip() or not payload.price_range.strip():
+        raise HTTPException(400, "All fields are required")
+    
+    image_url = ""
+    if payload.image:
+        image_url = await process_image_field_async(payload.image, user["user_id"], "tutor")
+    
+    tutor_id = f"tutor_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+    
+    sb.table("tutors").insert({
+        "tutor_id": tutor_id,
+        "user_id": user["user_id"],
+        "title": payload.title.strip(),
+        "course_name": payload.course_name.strip(),
+        "course_code": payload.course_code.strip().upper(),
+        "price_range": payload.price_range.strip(),
+        "image": image_url,
+        "created_at": now,
+        "updated_at": now
+    }).execute()
+    
+    return {"ok": True, "tutor_id": tutor_id}
+
+@api_router.get("/tutors")
+def list_tutors(search: Optional[str] = None):
+    query = sb.table("tutors").select("*").order("created_at", desc=True)
+    if search:
+        query = query.ilike("course_code", f"%{search}%")
+    tutors = query.execute().data or []
+    return tutors
+
+@api_router.get("/tutors/{tutor_id}")
+def get_tutor(tutor_id: str):
+    tutor = _maybe(sb.table("tutors").select("*").eq("tutor_id", tutor_id).maybe_single().execute())
+    if not tutor:
+        raise HTTPException(404, "Tutor not found")
+    return tutor
+
+@api_router.delete("/tutors/{tutor_id}")
+def delete_tutor(tutor_id: str, user: dict = Depends(get_current_user)):
+    tutor = _maybe(sb.table("tutors").select("*").eq("tutor_id", tutor_id).maybe_single().execute())
+    if not tutor:
+        raise HTTPException(404, "Tutor not found")
+    if tutor["user_id"] != user["user_id"] and not user.get("is_admin"):
+        raise HTTPException(403, "You can only delete your own ads")
+    sb.table("tutors").delete().eq("tutor_id", tutor_id).execute()
+    return {"ok": True}
 
 # ---------- Mount router ----------
 app.include_router(api_router)
