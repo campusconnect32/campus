@@ -692,6 +692,7 @@ def get_my_profile(user: dict = Depends(get_current_user)):
 # ---------- Mount router ----------
 app.include_router(api_router)
 
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
