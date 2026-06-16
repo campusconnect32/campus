@@ -229,6 +229,20 @@ class TutorReviewPayload(BaseModel):
     rating: int = 0          # 0 = no rating, 1-5 otherwise
     comment: str = ""
 
+class MarketItemCreatePayload(BaseModel):
+    title: str
+    description: str = ""
+    price: str
+    category: str
+    image: Optional[str] = ""
+
+class MarketItemUpdatePayload(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    price: Optional[str] = None
+    category: Optional[str] = None
+    image: Optional[str] = None
+
 # ---------- Auth ----------
 async def get_current_user(
     request: Request,
@@ -909,6 +923,91 @@ def my_tutor_ads_count(user: dict = Depends(get_current_user)):
     res = sb.table("tutors").select("tutor_id", count="exact").eq("user_id", user["user_id"]).execute()
     count = res.count if hasattr(res, 'count') else 0
     return {"count": count}
+
+# ---------- Marketplace ----------
+MARKET_CATEGORIES = ["Products", "Services"]
+
+@api_router.get("/marketplace/categories")
+def get_market_categories():
+    return MARKET_CATEGORIES
+
+@api_router.post("/marketplace/items")
+async def create_market_item(payload: MarketItemCreatePayload, user: dict = Depends(get_current_user)):
+    if not payload.title.strip() or not payload.price.strip() or not payload.category.strip():
+        raise HTTPException(400, "Title, price, and category are required")
+    if payload.category not in MARKET_CATEGORIES:
+        raise HTTPException(400, "Invalid category")
+
+    image_url = ""
+    if payload.image:
+        image_url = await process_image_field_async(payload.image, user["user_id"], "market")
+
+    item_id = f"item_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+
+    sb.table("marketplace_items").insert({
+        "item_id": item_id,
+        "user_id": user["user_id"],
+        "title": payload.title.strip(),
+        "description": payload.description.strip(),
+        "price": payload.price.strip(),
+        "category": payload.category.strip(),
+        "image": image_url,
+        "created_at": now,
+        "updated_at": now
+    }).execute()
+
+    return {"ok": True, "item_id": item_id}
+
+@api_router.get("/marketplace/items")
+def list_market_items(category: Optional[str] = None):
+    query = sb.table("marketplace_items").select("*").order("created_at", desc=True)
+    if category:
+        query = query.eq("category", category)
+    items = query.execute().data or []
+    return items
+
+@api_router.get("/marketplace/items/{item_id}")
+def get_market_item(item_id: str):
+    item = _maybe(sb.table("marketplace_items").select("*").eq("item_id", item_id).maybe_single().execute())
+    if not item:
+        raise HTTPException(404, "Item not found")
+    return item
+
+@api_router.put("/marketplace/items/{item_id}")
+async def update_market_item(item_id: str, payload: MarketItemUpdatePayload, user: dict = Depends(get_current_user)):
+    item = _maybe(sb.table("marketplace_items").select("*").eq("item_id", item_id).maybe_single().execute())
+    if not item:
+        raise HTTPException(404, "Item not found")
+    if item["user_id"] != user["user_id"] and not user.get("is_admin"):
+        raise HTTPException(403, "You can only edit your own listings")
+
+    updates = {}
+    for field in ["title", "description", "price", "category"]:
+        if getattr(payload, field, None) is not None:
+            val = getattr(payload, field).strip()
+            if field == "category" and val not in MARKET_CATEGORIES:
+                raise HTTPException(400, "Invalid category")
+            updates[field] = val
+
+    if payload.image is not None:
+        updates["image"] = await process_image_field_async(payload.image, user["user_id"], "market")
+
+    if updates:
+        updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+        sb.table("marketplace_items").update(updates).eq("item_id", item_id).execute()
+
+    return {"ok": True}
+
+@api_router.delete("/marketplace/items/{item_id}")
+def delete_market_item(item_id: str, user: dict = Depends(get_current_user)):
+    item = _maybe(sb.table("marketplace_items").select("*").eq("item_id", item_id).maybe_single().execute())
+    if not item:
+        raise HTTPException(404, "Item not found")
+    if item["user_id"] != user["user_id"] and not user.get("is_admin"):
+        raise HTTPException(403, "You can only delete your own listings")
+    sb.table("marketplace_items").delete().eq("item_id", item_id).execute()
+    return {"ok": True}
 
 # ---------- Mount router ----------
 app.include_router(api_router)
