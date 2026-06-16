@@ -1127,7 +1127,98 @@ def get_my_customers(user: dict = Depends(get_current_user)):
     result.sort(key=lambda x: x["last_message_time"], reverse=True)
     return result
 
+@api_router.get("/marketplace/my-customers")
+def get_my_customers(user: dict = Depends(get_current_user)):
+    # Get all messages where current user is the receiver (seller)
+    messages = sb.table("marketplace_messages") \
+        .select("sender_id") \
+        .eq("receiver_id", user["user_id"]) \
+        .execute().data or []
 
+    # Unique sender IDs
+    sender_ids = list({m["sender_id"] for m in messages})
+    if not sender_ids:
+        return []
+
+    # Get profiles for these senders
+    profiles = sb.table("user_profiles") \
+        .select("user_id, display_name, profile_image") \
+        .in_("user_id", sender_ids) \
+        .execute().data or []
+
+    # For each customer, get the number of distinct items they've chatted about
+    # and the time of the most recent message (for sorting)
+    result = []
+    for p in profiles:
+        cust_id = p["user_id"]
+        # Count distinct items
+        item_count_res = sb.table("marketplace_messages") \
+            .select("item_id", count="exact") \
+            .eq("receiver_id", user["user_id"]) \
+            .eq("sender_id", cust_id) \
+            .execute()
+        distinct_items = len({m["item_id"] for m in (item_count_res.data or [])}) if item_count_res.data else 0
+
+        # Most recent message time
+        last_msg = sb.table("marketplace_messages") \
+            .select("created_at") \
+            .eq("receiver_id", user["user_id"]) \
+            .eq("sender_id", cust_id) \
+            .order("created_at", desc=True) \
+            .limit(1) \
+            .execute()
+        last_time = (last_msg.data or [{}])[0].get("created_at") if last_msg.data else None
+
+        result.append({
+            "other_user_id": cust_id,
+            "other_user_name": p.get("display_name") or "Unknown",
+            "other_user_picture": p.get("profile_image") or "",
+            "distinct_items": distinct_items,
+            "last_message_time": last_time,
+        })
+
+    # Sort by most recent message descending
+    result.sort(key=lambda x: x["last_message_time"] or "", reverse=True)
+    return result
+
+
+@api_router.get("/marketplace/customers/{customer_id}/items")
+def get_customer_items(customer_id: str, user: dict = Depends(get_current_user)):
+    # Get all messages between seller (current user) and this customer,
+    # grouped by item_id, with the last message preview.
+    msgs = sb.table("marketplace_messages") \
+        .select("item_id, content, created_at") \
+        .or_(f"and(sender_id.eq.{user['user_id']},receiver_id.eq.{customer_id}),and(sender_id.eq.{customer_id},receiver_id.eq.{user['user_id']})") \
+        .order("created_at", desc=False) \
+        .execute().data or []
+
+    # Group by item_id, collect all messages
+    item_map = {}
+    for m in msgs:
+        iid = m["item_id"]
+        if iid not in item_map:
+            item_map[iid] = []
+        item_map[iid].append(m)
+
+    # For each item, get the title
+    item_ids = list(item_map.keys())
+    items = sb.table("marketplace_items").select("item_id, title").in_("item_id", item_ids).execute().data or []
+    title_map = {i["item_id"]: i["title"] for i in items}
+
+    result = []
+    for iid, messages in item_map.items():
+        last_msg = messages[-1]  # most recent
+        result.append({
+            "item_id": iid,
+            "item_title": title_map.get(iid, "Unknown item"),
+            "last_message": last_msg["content"],
+            "last_message_time": last_msg["created_at"],
+            "message_count": len(messages),
+        })
+
+    # Sort by latest message time
+    result.sort(key=lambda x: x["last_message_time"], reverse=True)
+    return result
 
 # ---------- Mount router ----------
 app.include_router(api_router)
