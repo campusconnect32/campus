@@ -825,17 +825,49 @@ def create_tutor_review(tutor_id: str, payload: TutorReviewPayload, user: dict =
     rating = payload.rating
     if rating > 0 and (rating < 1 or rating > 5):
         raise HTTPException(400, "Rating must be between 1 and 5 if provided")
-    review_id = f"rev_{uuid.uuid4().hex[:12]}"
-    now = datetime.now(timezone.utc).isoformat()
-    sb.table("tutor_reviews").insert({
-        "review_id": review_id,
-        "tutor_id": tutor_id,
-        "user_id": user["user_id"],
-        "rating": rating,
-        "comment": payload.comment or "",
-        "created_at": now
-    }).execute()
-    return {"ok": True, "review_id": review_id}
+
+    if rating > 0:
+        # Rating: one per user → update if exists
+        existing_rating = _maybe(sb.table("tutor_reviews")
+            .select("review_id")
+            .eq("tutor_id", tutor_id)
+            .eq("user_id", user["user_id"])
+            .gt("rating", 0)
+            .maybe_single().execute())
+
+        if existing_rating:
+            # Update existing rating
+            sb.table("tutor_reviews") \
+                .update({"rating": rating, "created_at": datetime.now(timezone.utc).isoformat()}) \
+                .eq("review_id", existing_rating["review_id"]) \
+                .execute()
+            return {"ok": True, "review_id": existing_rating["review_id"], "updated": True}
+        else:
+            # Insert new rating row (comment empty)
+            review_id = f"rev_{uuid.uuid4().hex[:12]}"
+            now = datetime.now(timezone.utc).isoformat()
+            sb.table("tutor_reviews").insert({
+                "review_id": review_id,
+                "tutor_id": tutor_id,
+                "user_id": user["user_id"],
+                "rating": rating,
+                "comment": "",
+                "created_at": now
+            }).execute()
+            return {"ok": True, "review_id": review_id}
+    else:
+        # Chat message: always insert new row
+        review_id = f"rev_{uuid.uuid4().hex[:12]}"
+        now = datetime.now(timezone.utc).isoformat()
+        sb.table("tutor_reviews").insert({
+            "review_id": review_id,
+            "tutor_id": tutor_id,
+            "user_id": user["user_id"],
+            "rating": 0,
+            "comment": payload.comment or "",
+            "created_at": now
+        }).execute()
+        return {"ok": True, "review_id": review_id}
 
 @api_router.get("/tutors/{tutor_id}/reviews")
 def list_tutor_reviews(tutor_id: str):
@@ -859,13 +891,24 @@ def list_tutor_reviews(tutor_id: str):
         })
     return enriched
 
+
+@api_router.get("/tutors/{tutor_id}/my-rating")
+def get_my_rating(tutor_id: str, user: dict = Depends(get_current_user)):
+    review = _maybe(sb.table("tutor_reviews")
+        .select("rating")
+        .eq("tutor_id", tutor_id)
+        .eq("user_id", user["user_id"])
+        .gt("rating", 0)
+        .maybe_single().execute())
+    return {"rating": review["rating"] if review else 0}
+
+
+# ---------- My Ads Count ----------
 @api_router.get("/tutors/myads/count")
 def my_tutor_ads_count(user: dict = Depends(get_current_user)):
     res = sb.table("tutors").select("tutor_id", count="exact").eq("user_id", user["user_id"]).execute()
     count = res.count if hasattr(res, 'count') else 0
     return {"count": count}
-
-
 
 # ---------- Mount router ----------
 app.include_router(api_router)
