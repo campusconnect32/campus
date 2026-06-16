@@ -840,7 +840,7 @@ def create_tutor_review(tutor_id: str, payload: TutorReviewPayload, user: dict =
 @api_router.get("/tutors/{tutor_id}/reviews")
 def list_tutor_reviews(tutor_id: str):
     reviews = sb.table("tutor_reviews")\
-        .select("review_id, tutor_id, user_id, rating, comment, created_at, users!inner(name, picture)")\
+        .select("review_id, tutor_id, user_id, rating, comment, created_at, users!fk_review_user(name, picture)")\
         .eq("tutor_id", tutor_id)\
         .order("created_at", desc=True)\
         .execute().data or []
@@ -858,6 +858,7 @@ def list_tutor_reviews(tutor_id: str):
             "user_picture": user.get("picture", ""),
         })
     return enriched
+
 
 # ---------- Mount router ----------
 app.include_router(api_router)
