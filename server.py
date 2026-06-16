@@ -193,10 +193,10 @@ class GoogleAuthPayload(BaseModel):
 class ProfileSetupPayload(BaseModel):
     date_of_birth: str
     display_name: Optional[str] = ""
-    gender: Optional[str] = ""
-    year_of_study: Optional[str] = ""
-    course: Optional[str] = ""
-    campus: Optional[str] = ""
+    gender: str = ""          # required by validation
+    year_of_study: str = ""   # required
+    course: str = ""          # required
+    campus: str = ""          # required
     profile_image: Optional[str] = ""
     gallery_images: Optional[List[str]] = []
 
@@ -596,10 +596,20 @@ def get_profile(user: dict) -> dict:
 
 @api_router.post("/profile/setup")
 async def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current_user)):
+    # Validate compulsory fields
+    if not payload.gender or not payload.year_of_study or not payload.course or not payload.campus:
+        raise HTTPException(400, "Gender, year of study, course, and campus are required")
+
     profile_image = await process_image_field_async(payload.profile_image, user["user_id"], "profile")
     gallery = []
     for i, img in enumerate(payload.gallery_images or []):
         gallery.append(await process_image_field_async(img, user["user_id"], f"gallery_{i}"))
+
+    # Check if all required fields are present
+    required_fields_present = bool(
+        payload.date_of_birth and payload.gender and
+        payload.year_of_study and payload.course and payload.campus
+    )
 
     profile_data = {
         "user_id": user["user_id"],
@@ -611,7 +621,7 @@ async def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_c
         "campus": payload.campus,
         "profile_image": profile_image,
         "gallery_images": gallery,
-        "onboarding_complete": True,
+        "onboarding_complete": required_fields_present,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -647,13 +657,29 @@ async def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get
     if not updates:
         return {"ok": True, "profile": get_profile(user)}
 
+    # After update, check if all required fields are now present to re-set onboarding
+    existing = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
+    current_profile = existing if existing else {}
+    # Merge existing values with updates
+    for k in ["date_of_birth", "gender", "year_of_study", "course", "campus"]:
+        if k in updates:
+            current_profile[k] = updates[k]
+        else:
+            current_profile[k] = current_profile.get(k, "")
+
+    required_fields_present = bool(
+        current_profile.get("date_of_birth") and current_profile.get("gender") and
+        current_profile.get("year_of_study") and current_profile.get("course") and current_profile.get("campus")
+    )
+    if required_fields_present and not current_profile.get("onboarding_complete"):
+        updates["onboarding_complete"] = True
+
     updates["updated_at"] = datetime.now(timezone.utc).isoformat()
-    existing = _maybe(sb.table("user_profiles").select("user_id").eq("user_id", user["user_id"]).maybe_single().execute())
     if existing:
         sb.table("user_profiles").update(updates).eq("user_id", user["user_id"]).execute()
     else:
         updates["user_id"] = user["user_id"]
-        updates["onboarding_complete"] = False
+        updates["onboarding_complete"] = required_fields_present
         updates["created_at"] = datetime.now(timezone.utc).isoformat()
         sb.table("user_profiles").insert(updates).execute()
 
