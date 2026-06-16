@@ -225,8 +225,8 @@ class TutorUpdatePayload(BaseModel):
     image: Optional[str] = None
 
 class TutorReviewPayload(BaseModel):
-    rating: int
-    comment: Optional[str] = ""
+    rating: int = 0          # 0 = no rating, 1-5 otherwise
+    comment: str = ""
 
 # ---------- Auth ----------
 async def get_current_user(
@@ -743,6 +743,15 @@ def get_tutor(tutor_id: str):
     tutor = _maybe(sb.table("tutors").select("*").eq("tutor_id", tutor_id).maybe_single().execute())
     if not tutor:
         raise HTTPException(404, "Tutor not found")
+    # Calculate average rating
+    rating_data = sb.table("tutor_reviews") \
+        .select("rating") \
+        .eq("tutor_id", tutor_id) \
+        .execute().data or []
+    valid_ratings = [r["rating"] for r in rating_data if r["rating"] > 0]
+    avg_rating = round(sum(valid_ratings) / len(valid_ratings), 1) if valid_ratings else 0
+    tutor["average_rating"] = avg_rating
+    tutor["rating_count"] = len(valid_ratings)
     return tutor
 
 @api_router.put("/tutors/{tutor_id}")
@@ -786,16 +795,17 @@ def create_tutor_review(tutor_id: str, payload: TutorReviewPayload, user: dict =
     tutor = _maybe(sb.table("tutors").select("tutor_id").eq("tutor_id", tutor_id).maybe_single().execute())
     if not tutor:
         raise HTTPException(404, "Tutor not found")
-    if payload.rating < 1 or payload.rating > 5:
-        raise HTTPException(400, "Rating must be between 1 and 5")
-
+    rating = payload.rating
+    if rating > 0 and (rating < 1 or rating > 5):
+        raise HTTPException(400, "Rating must be between 1 and 5 if provided")
+    # If rating == 0, it's just a chat message
     review_id = f"rev_{uuid.uuid4().hex[:12]}"
     now = datetime.now(timezone.utc).isoformat()
     sb.table("tutor_reviews").insert({
         "review_id": review_id,
         "tutor_id": tutor_id,
         "user_id": user["user_id"],
-        "rating": payload.rating,
+        "rating": rating,
         "comment": payload.comment or "",
         "created_at": now
     }).execute()
@@ -803,7 +813,6 @@ def create_tutor_review(tutor_id: str, payload: TutorReviewPayload, user: dict =
 
 @api_router.get("/tutors/{tutor_id}/reviews")
 def list_tutor_reviews(tutor_id: str):
-    # Join with users to get name and picture
     reviews = sb.table("tutor_reviews")\
         .select("review_id, tutor_id, user_id, rating, comment, created_at, users!inner(name, picture)")\
         .eq("tutor_id", tutor_id)\
