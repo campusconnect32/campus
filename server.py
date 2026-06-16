@@ -133,17 +133,14 @@ async def get_location_from_ip(ip: str) -> dict:
 
 # ---------- Image processing (non‑blocking) ----------
 def compress_image_sync(base64_str: str, max_size_kb: int = 300) -> bytes:
-    """Compress a base64 image to WebP, returned as bytes."""
     if len(base64_str) > MAX_IMAGE_BASE64_SIZE:
         raise HTTPException(400, "Image too large (max 5 MB)")
-    # Strip header if present
     if "," in base64_str:
         base64_str = base64_str.split(",", 1)[1]
     img_data = base64.b64decode(base64_str)
     img = Image.open(io.BytesIO(img_data))
     if img.mode in ("RGBA", "P"):
         img = img.convert("RGB")
-    # Resize if needed
     w, h = img.size
     if w > 1200 or h > 1200:
         img.thumbnail((1200, 1200), Image.Resampling.LANCZOS)
@@ -158,7 +155,6 @@ def compress_image_sync(base64_str: str, max_size_kb: int = 300) -> bytes:
     return buf.getvalue()
 
 def upload_image_to_supabase_sync(file_bytes: bytes, user_id: str, filename: str) -> str:
-    """Upload image to Supabase Storage. Raises exception on failure."""
     path = f"{user_id}/{filename}"
     sb.storage.from_(STORAGE_BUCKET).upload(
         path=path,
@@ -171,21 +167,14 @@ def upload_image_to_supabase_sync(file_bytes: bytes, user_id: str, filename: str
     return f"{SUPABASE_URL}/storage/v1/object/public/{STORAGE_BUCKET}/{path}"
 
 async def process_image_field_async(image_value: str, user_id: str, filename_prefix: str) -> str:
-    """
-    If image_value is a data URL, compress it and upload to Supabase Storage.
-    Returns the public URL. If image_value is empty or already a remote URL,
-    returns it unchanged.
-    """
     if not image_value:
         return image_value
-    # Only process local data‑URLs
     if image_value.startswith("data:image") or (len(image_value) > 1000 and "base64" in image_value):
         loop = asyncio.get_running_loop()
         compressed = await loop.run_in_executor(None, compress_image_sync, image_value)
         filename = f"{filename_prefix}_{uuid.uuid4().hex[:8]}.webp"
         public_url = await loop.run_in_executor(None, upload_image_to_supabase_sync, compressed, user_id, filename)
         return public_url
-    # Already a remote URL (e.g., Google picture) – leave as is
     return image_value
 
 # ---------- Models ----------
@@ -204,12 +193,20 @@ class GoogleAuthPayload(BaseModel):
 class ProfileSetupPayload(BaseModel):
     date_of_birth: str
     display_name: Optional[str] = ""
+    gender: Optional[str] = ""
+    year_of_study: Optional[str] = ""
+    course: Optional[str] = ""
+    campus: Optional[str] = ""
     profile_image: Optional[str] = ""
     gallery_images: Optional[List[str]] = []
 
 class ProfileUpdatePayload(BaseModel):
     date_of_birth: Optional[str] = None
     display_name: Optional[str] = None
+    gender: Optional[str] = None
+    year_of_study: Optional[str] = None
+    course: Optional[str] = None
+    campus: Optional[str] = None
     profile_image: Optional[str] = None
     gallery_images: Optional[List[str]] = None
 
@@ -235,7 +232,6 @@ async def get_current_user(
         raise HTTPException(status_code=401, detail="User not found")
     if user.get("deleted") or user.get("banned"):
         raise HTTPException(status_code=401, detail="Account deleted or banned")
-    # Update last_active (fire‑and‑forget, not critical for response)
     sb.table("users").update({"last_active": datetime.now(timezone.utc).isoformat()}).eq("user_id", user["user_id"]).execute()
     return user
 
@@ -263,7 +259,6 @@ def auth_google(payload: GoogleAuthPayload, request: Request, response: Response
             "name": name, "picture": picture, "last_active": now_iso, "deleted": False
         }).eq("user_id", user_id).execute()
     else:
-        # Check for previously deleted account
         deleted_user = _maybe(sb.table("users").select("*").eq("email", email).eq("deleted", True).maybe_single().execute())
         if deleted_user:
             if deleted_user.get("banned"):
@@ -340,7 +335,6 @@ def auth_logout(
 async def delete_account(user: dict = Depends(get_current_user)):
     sb.table("users").update({"deleted": True}).eq("user_id", user["user_id"]).execute()
     sb.table("user_sessions").delete().eq("user_id", user["user_id"]).execute()
-    # Clear sensitive profile data
     sb.table("user_profiles").update({
         "display_name": None,
         "bio": None,
@@ -568,14 +562,28 @@ def get_profile(user: dict) -> dict:
         "picture": user.get("picture"),
     }
     if not profile:
-        return {**base, "onboarding_complete": False, "country": None, "city": None,
-                "date_of_birth": None, "display_name": user.get("name", ""),
-                "profile_image": user.get("picture", ""), "gallery_images": [],
-                "location_source": "none"}
+        return {
+            **base,
+            "onboarding_complete": False,
+            "country": None, "city": None,
+            "date_of_birth": None,
+            "display_name": user.get("name", ""),
+            "gender": "",
+            "year_of_study": "",
+            "course": "",
+            "campus": "",
+            "profile_image": user.get("picture", ""),
+            "gallery_images": [],
+            "location_source": "none"
+        }
     return {
         **base,
         "date_of_birth": profile.get("date_of_birth"),
         "display_name": profile.get("display_name", user.get("name", "")),
+        "gender": profile.get("gender", ""),
+        "year_of_study": profile.get("year_of_study", ""),
+        "course": profile.get("course", ""),
+        "campus": profile.get("campus", ""),
         "profile_image": profile.get("profile_image") or user.get("picture", ""),
         "gallery_images": profile.get("gallery_images") or [],
         "country": profile.get("country"),
@@ -597,6 +605,10 @@ async def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_c
         "user_id": user["user_id"],
         "date_of_birth": payload.date_of_birth,
         "display_name": payload.display_name or user.get("name", ""),
+        "gender": payload.gender,
+        "year_of_study": payload.year_of_study,
+        "course": payload.course,
+        "campus": payload.campus,
         "profile_image": profile_image,
         "gallery_images": gallery,
         "onboarding_complete": True,
@@ -605,7 +617,6 @@ async def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_c
 
     existing = _maybe(sb.table("user_profiles").select("user_id").eq("user_id", user["user_id"]).maybe_single().execute())
     if existing:
-        # Preserve existing location if already set
         if existing.get("gps_latitude"):
             profile_data["gps_latitude"] = existing["gps_latitude"]
             profile_data["gps_longitude"] = existing["gps_longitude"]
@@ -621,7 +632,7 @@ async def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_c
 @api_router.put("/profile")
 async def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_current_user)):
     updates = {}
-    for field in ["date_of_birth", "display_name"]:
+    for field in ["date_of_birth", "display_name", "gender", "year_of_study", "course", "campus"]:
         if getattr(payload, field, None) is not None:
             updates[field] = getattr(payload, field)
 
