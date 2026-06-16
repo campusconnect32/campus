@@ -224,6 +224,10 @@ class TutorUpdatePayload(BaseModel):
     price_range: Optional[str] = None
     image: Optional[str] = None
 
+class TutorReviewPayload(BaseModel):
+    rating: int
+    comment: Optional[str] = ""
+
 # ---------- Auth ----------
 async def get_current_user(
     request: Request,
@@ -775,6 +779,50 @@ def delete_tutor(tutor_id: str, user: dict = Depends(get_current_user)):
         raise HTTPException(403, "You can only delete your own ads")
     sb.table("tutors").delete().eq("tutor_id", tutor_id).execute()
     return {"ok": True}
+
+# ---------- Tutor Reviews ----------
+@api_router.post("/tutors/{tutor_id}/reviews")
+def create_tutor_review(tutor_id: str, payload: TutorReviewPayload, user: dict = Depends(get_current_user)):
+    tutor = _maybe(sb.table("tutors").select("tutor_id").eq("tutor_id", tutor_id).maybe_single().execute())
+    if not tutor:
+        raise HTTPException(404, "Tutor not found")
+    if payload.rating < 1 or payload.rating > 5:
+        raise HTTPException(400, "Rating must be between 1 and 5")
+
+    review_id = f"rev_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+    sb.table("tutor_reviews").insert({
+        "review_id": review_id,
+        "tutor_id": tutor_id,
+        "user_id": user["user_id"],
+        "rating": payload.rating,
+        "comment": payload.comment or "",
+        "created_at": now
+    }).execute()
+    return {"ok": True, "review_id": review_id}
+
+@api_router.get("/tutors/{tutor_id}/reviews")
+def list_tutor_reviews(tutor_id: str):
+    # Join with users to get name and picture
+    reviews = sb.table("tutor_reviews")\
+        .select("review_id, tutor_id, user_id, rating, comment, created_at, users!inner(name, picture)")\
+        .eq("tutor_id", tutor_id)\
+        .order("created_at", desc=True)\
+        .execute().data or []
+    enriched = []
+    for r in reviews:
+        user = r.get("users", {})
+        enriched.append({
+            "review_id": r["review_id"],
+            "tutor_id": r["tutor_id"],
+            "user_id": r["user_id"],
+            "rating": r["rating"],
+            "comment": r["comment"],
+            "created_at": r["created_at"],
+            "user_name": user.get("name", "Unknown"),
+            "user_picture": user.get("picture", ""),
+        })
+    return enriched
 
 # ---------- Mount router ----------
 app.include_router(api_router)
