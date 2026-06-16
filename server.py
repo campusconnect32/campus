@@ -1075,6 +1075,60 @@ def get_market_messages(item_id: str, user: dict = Depends(get_current_user)):
         m["sender_picture"] = p.get("profile_image") or ""
     return messages
 
+@api_router.get("/marketplace/my-customers")
+def get_my_customers(user: dict = Depends(get_current_user)):
+    # Get all messages where current user is the receiver (i.e. seller)
+    messages = sb.table("marketplace_messages") \
+        .select("message_id, item_id, sender_id, content, created_at") \
+        .eq("receiver_id", user["user_id"]) \
+        .order("created_at", desc=False) \
+        .execute().data or []
+
+    # Group by (item_id, sender_id) to get unique conversations
+    conv_map = {}
+    for m in messages:
+        key = (m["item_id"], m["sender_id"])
+        if key not in conv_map:
+            conv_map[key] = m
+        else:
+            # keep the latest message
+            if m["created_at"] > conv_map[key]["created_at"]:
+                conv_map[key] = m
+
+    conversations = list(conv_map.values())
+
+    if not conversations:
+        return []
+
+    # Get item titles
+    item_ids = list({c["item_id"] for c in conversations})
+    items = sb.table("marketplace_items").select("item_id, title").in_("item_id", item_ids).execute().data or []
+    item_map = {i["item_id"]: i["title"] for i in items}
+
+    # Get sender profiles
+    sender_ids = list({c["sender_id"] for c in conversations})
+    profiles = sb.table("user_profiles").select("user_id, display_name, profile_image").in_("user_id", sender_ids).execute().data or []
+    profile_map = {p["user_id"]: p for p in profiles}
+
+    result = []
+    for c in conversations:
+        sender = profile_map.get(c["sender_id"], {})
+        result.append({
+            "item_id": c["item_id"],
+            "item_title": item_map.get(c["item_id"], "Unknown item"),
+            "other_user_id": c["sender_id"],
+            "other_user_name": sender.get("display_name") or "Unknown",
+            "other_user_picture": sender.get("profile_image") or "",
+            "last_message": c["content"],
+            "last_message_time": c["created_at"],
+        })
+
+    # Sort most recent first
+    result.sort(key=lambda x: x["last_message_time"], reverse=True)
+    return result
+
+
+
 # ---------- Mount router ----------
 app.include_router(api_router)
 
