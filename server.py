@@ -859,6 +859,13 @@ def list_tutor_reviews(tutor_id: str):
         })
     return enriched
 
+@api_router.get("/tutors/myads/count")
+def my_tutor_ads_count(user: dict = Depends(get_current_user)):
+    res = sb.table("tutors").select("tutor_id", count="exact").eq("user_id", user["user_id"]).execute()
+    count = res.count if hasattr(res, 'count') else 0
+    return {"count": count}
+
+
 
 # ---------- Mount router ----------
 app.include_router(api_router)
