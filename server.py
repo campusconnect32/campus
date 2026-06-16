@@ -3,14 +3,15 @@ from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
-import os, logging, uuid, math, httpx, asyncio, time
+import os, logging, uuid, math, httpx, asyncio, time, base64, bcrypt
 from pathlib import Path
 from pydantic import BaseModel
-from typing import Optional, List, Dict
+from typing import Optional, List
 from datetime import datetime, timezone, timedelta
 from functools import lru_cache
 from PIL import Image
-import io, base64, json, bcrypt
+import io
+import threading
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -40,10 +41,10 @@ app.add_middleware(
 )
 api_router = APIRouter(prefix="/api")
 
-# ---------- Simple in‑memory rate limiter with periodic cleanup ----------
+# ---------- Rate limiter with cleanup ----------
 RATE_LIMIT_WINDOW = 60
 RATE_LIMIT_MAX = 10
-rate_limit_store: Dict[str, list] = {}
+rate_limit_store: dict = {}
 
 def check_rate_limit(key: str, max_req: int = RATE_LIMIT_MAX, window: int = RATE_LIMIT_WINDOW):
     now = time.time()
@@ -54,7 +55,6 @@ def check_rate_limit(key: str, max_req: int = RATE_LIMIT_MAX, window: int = RATE
     timestamps.append(now)
     rate_limit_store[key] = timestamps
 
-# Periodic cleanup of expired entries (runs every 5 minutes)
 def cleanup_rate_limits():
     while True:
         time.sleep(300)
@@ -66,16 +66,14 @@ def cleanup_rate_limits():
             else:
                 del rate_limit_store[key]
 
-import threading
 threading.Thread(target=cleanup_rate_limits, daemon=True).start()
 
 # ---------- Constants ----------
-EARTH_RADIUS_KM = 6371
 MAX_GPS_AGE_HOURS = 24
 STORAGE_BUCKET = "avatars"
 MAX_IMAGE_BASE64_SIZE = 5 * 1024 * 1024
 
-# ---------- Helper functions ----------
+# ---------- Helpers ----------
 def _parse_dt(value):
     if value is None: return None
     if isinstance(value, datetime): dt = value
@@ -92,7 +90,7 @@ def _maybe(res):
         return None
     return getattr(res, "data", None)
 
-# Cached reverse geocoding (rounded to ~1 km)
+# Cached reverse geocoding (~1 km granularity)
 @lru_cache(maxsize=1024)
 def _cached_reverse_geocode(lat_rounded: float, lon_rounded: float) -> tuple:
     try:
@@ -122,58 +120,86 @@ async def get_location_from_ip(ip: str) -> dict:
             if resp.status_code == 200:
                 data = resp.json()
                 if data.get('status') == 'success':
-                    return {'latitude': data.get('lat'), 'longitude': data.get('lon'),
-                            'country': data.get('country'), 'city': data.get('city'), 'source': 'ip'}
+                    return {
+                        'latitude': data.get('lat'),
+                        'longitude': data.get('lon'),
+                        'country': data.get('country'),
+                        'city': data.get('city'),
+                        'source': 'ip'
+                    }
     except Exception as e:
         logger.error(f"IP geolocation failed: {e}")
     return None
 
-# ---------- Image Helpers (async, non‑blocking) ----------
+# ---------- Image processing (non‑blocking) ----------
 def compress_image_sync(base64_str: str, max_size_kb: int = 300) -> bytes:
+    """Compress a base64 image to WebP, returned as bytes."""
     if len(base64_str) > MAX_IMAGE_BASE64_SIZE:
         raise HTTPException(400, "Image too large (max 5 MB)")
-    if "," in base64_str: base64_str = base64_str.split(",", 1)[1]
+    # Strip header if present
+    if "," in base64_str:
+        base64_str = base64_str.split(",", 1)[1]
     img_data = base64.b64decode(base64_str)
     img = Image.open(io.BytesIO(img_data))
-    if img.mode in ("RGBA", "P"): img = img.convert("RGB")
+    if img.mode in ("RGBA", "P"):
+        img = img.convert("RGB")
+    # Resize if needed
     w, h = img.size
-    if w > 1200 or h > 1200: img.thumbnail((1200, 1200), Image.Resampling.LANCZOS)
+    if w > 1200 or h > 1200:
+        img.thumbnail((1200, 1200), Image.Resampling.LANCZOS)
     quality = 85
     while True:
         buf = io.BytesIO()
         img.save(buf, format="WEBP", quality=quality)
         size_kb = buf.tell() / 1024
-        if size_kb <= max_size_kb or quality <= 20: break
+        if size_kb <= max_size_kb or quality <= 20:
+            break
         quality -= 5
     return buf.getvalue()
 
 def upload_image_to_supabase_sync(file_bytes: bytes, user_id: str, filename: str) -> str:
+    """Upload image to Supabase Storage. Raises exception on failure."""
     path = f"{user_id}/{filename}"
     sb.storage.from_(STORAGE_BUCKET).upload(
-        path=path, file=file_bytes,
-        file_options={"content-type": "image/webp", "cache-control": "public, max-age=31536000, immutable"}
+        path=path,
+        file=file_bytes,
+        file_options={
+            "content-type": "image/webp",
+            "cache-control": "public, max-age=31536000, immutable"
+        }
     )
     return f"{SUPABASE_URL}/storage/v1/object/public/{STORAGE_BUCKET}/{path}"
 
 async def process_image_field_async(image_value: str, user_id: str, filename_prefix: str) -> str:
-    """Offload heavy image processing to a thread pool."""
-    if not image_value: return image_value
+    """
+    If image_value is a data URL, compress it and upload to Supabase Storage.
+    Returns the public URL. If image_value is empty or already a remote URL,
+    returns it unchanged.
+    """
+    if not image_value:
+        return image_value
+    # Only process local data‑URLs
     if image_value.startswith("data:image") or (len(image_value) > 1000 and "base64" in image_value):
-        if len(image_value) > MAX_IMAGE_BASE64_SIZE:
-            raise HTTPException(400, "Image too large (max 5 MB)")
         loop = asyncio.get_running_loop()
         compressed = await loop.run_in_executor(None, compress_image_sync, image_value)
-        filename = f"{filename_prefix}_{uuid.uuid4().hex[:8]}.jpg"
-        url = await loop.run_in_executor(None, upload_image_to_supabase_sync, compressed, user_id, filename)
-        return url
+        filename = f"{filename_prefix}_{uuid.uuid4().hex[:8]}.webp"
+        public_url = await loop.run_in_executor(None, upload_image_to_supabase_sync, compressed, user_id, filename)
+        return public_url
+    # Already a remote URL (e.g., Google picture) – leave as is
     return image_value
 
 # ---------- Models ----------
 class LocationUpdatePayload(BaseModel):
-    latitude: float; longitude: float; accuracy: Optional[float] = None
+    latitude: float
+    longitude: float
+    accuracy: Optional[float] = None
 
 class GoogleAuthPayload(BaseModel):
-    id_token: str; email: str; name: str; picture: str; ref: Optional[str] = None
+    id_token: str
+    email: str
+    name: str
+    picture: str
+    ref: Optional[str] = None
 
 class ProfileSetupPayload(BaseModel):
     date_of_birth: str
@@ -194,21 +220,26 @@ async def get_current_user(
     authorization: Optional[str] = Header(default=None),
 ) -> dict:
     token = session_token_cookie
-    if not token and authorization and authorization.startswith("Bearer "): token = authorization.split(" ", 1)[1]
-    if not token: raise HTTPException(status_code=401, detail="Not authenticated")
+    if not token and authorization and authorization.startswith("Bearer "):
+        token = authorization.split(" ", 1)[1]
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
     res = sb.table("user_sessions").select("*").eq("session_token", token).maybe_single().execute()
     session = _maybe(res)
-    if not session: raise HTTPException(status_code=401, detail="Invalid session")
-    if _parse_dt(session["expires_at"]) < datetime.now(timezone.utc): raise HTTPException(status_code=401)
+    if not session:
+        raise HTTPException(status_code=401, detail="Invalid session")
+    if _parse_dt(session["expires_at"]) < datetime.now(timezone.utc):
+        raise HTTPException(status_code=401, detail="Session expired")
     user = _maybe(sb.table("users").select("*").eq("user_id", session["user_id"]).maybe_single().execute())
-    if not user: raise HTTPException(status_code=401, detail="User not found")
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
     if user.get("deleted") or user.get("banned"):
         raise HTTPException(status_code=401, detail="Account deleted or banned")
-    # Update last_active
+    # Update last_active (fire‑and‑forget, not critical for response)
     sb.table("users").update({"last_active": datetime.now(timezone.utc).isoformat()}).eq("user_id", user["user_id"]).execute()
     return user
 
-# ---------- Root endpoints ----------
+# ---------- Root ----------
 @app.get("/")
 def root():
     return {"message": "CampusConnect API is running"}
@@ -223,27 +254,44 @@ def auth_google(payload: GoogleAuthPayload, request: Request, response: Response
     check_rate_limit(f"auth_{request.client.host}", max_req=5)
     email, name, picture = payload.email, payload.name, payload.picture
     session_token = f"session_{uuid.uuid4().hex[:32]}"
-    existing = _maybe(sb.table("users").select("*").eq("email", email).eq("deleted", False).maybe_single().execute())
     now_iso = datetime.now(timezone.utc).isoformat()
+
+    existing = _maybe(sb.table("users").select("*").eq("email", email).eq("deleted", False).maybe_single().execute())
     if existing:
         user_id = existing["user_id"]
-        sb.table("users").update({"name": name, "picture": picture, "last_active": now_iso, "deleted": False}).eq("user_id", user_id).execute()
+        sb.table("users").update({
+            "name": name, "picture": picture, "last_active": now_iso, "deleted": False
+        }).eq("user_id", user_id).execute()
     else:
+        # Check for previously deleted account
         deleted_user = _maybe(sb.table("users").select("*").eq("email", email).eq("deleted", True).maybe_single().execute())
         if deleted_user:
             if deleted_user.get("banned"):
                 raise HTTPException(403, "Your account has been banned.")
             user_id = deleted_user["user_id"]
-            sb.table("users").update({"name": name, "picture": picture, "last_active": now_iso, "deleted": False}).eq("user_id", user_id).execute()
+            sb.table("users").update({
+                "name": name, "picture": picture, "last_active": now_iso, "deleted": False
+            }).eq("user_id", user_id).execute()
         else:
             user_id = f"user_{uuid.uuid4().hex[:12]}"
             sb.table("users").insert({
                 "user_id": user_id, "email": email, "name": name, "picture": picture,
                 "created_at": now_iso, "last_active": now_iso,
             }).execute()
+
     expires_at = datetime.now(timezone.utc) + timedelta(days=7)
-    sb.table("user_sessions").upsert({"session_token": session_token, "user_id": user_id, "expires_at": expires_at.isoformat(), "created_at": now_iso}).execute()
-    response.set_cookie(key="session_token", value=session_token, httponly=True, secure=request.url.scheme == "https", samesite="lax", path="/", max_age=7*24*60*60)
+    sb.table("user_sessions").upsert({
+        "session_token": session_token,
+        "user_id": user_id,
+        "expires_at": expires_at.isoformat(),
+        "created_at": now_iso
+    }).execute()
+
+    response.set_cookie(
+        key="session_token", value=session_token,
+        httponly=True, secure=request.url.scheme == "https",
+        samesite="lax", path="/", max_age=7*24*60*60
+    )
     return {"ok": True, "user_id": user_id, "token": session_token}
 
 @api_router.get("/auth/me")
@@ -255,6 +303,7 @@ def auth_me(user: dict = Depends(get_current_user)):
     if has_gps and profile.get("gps_verified_at"):
         gps_age = datetime.now(timezone.utc) - _parse_dt(profile["gps_verified_at"])
         gps_stale = gps_age > timedelta(hours=MAX_GPS_AGE_HOURS)
+
     return {
         "user_id": user["user_id"],
         "email": user["email"],
@@ -274,22 +323,33 @@ def accept_privacy(user: dict = Depends(get_current_user)):
     return {"ok": True}
 
 @api_router.post("/auth/logout")
-def auth_logout(response: Response, session_token_cookie: Optional[str] = Cookie(default=None, alias="session_token"), authorization: Optional[str] = Header(default=None)):
+def auth_logout(
+    response: Response,
+    session_token_cookie: Optional[str] = Cookie(default=None, alias="session_token"),
+    authorization: Optional[str] = Header(default=None)
+):
     token = session_token_cookie
-    if not token and authorization and authorization.startswith("Bearer "): token = authorization.split(" ", 1)[1]
-    if token: sb.table("user_sessions").delete().eq("session_token", token).execute()
+    if not token and authorization and authorization.startswith("Bearer "):
+        token = authorization.split(" ", 1)[1]
+    if token:
+        sb.table("user_sessions").delete().eq("session_token", token).execute()
     response.delete_cookie(key="session_token", path="/", samesite="lax", secure=False)
     return {"ok": True}
 
 @api_router.delete("/auth/me")
 async def delete_account(user: dict = Depends(get_current_user)):
-    # Soft delete user and clear profile sensitive data
     sb.table("users").update({"deleted": True}).eq("user_id", user["user_id"]).execute()
     sb.table("user_sessions").delete().eq("user_id", user["user_id"]).execute()
+    # Clear sensitive profile data
     sb.table("user_profiles").update({
-        "display_name": None, "bio": None, "date_of_birth": None,
-        "profile_image": None, "gallery_images": None,
-        "gps_latitude": None, "gps_longitude": None, "gps_verified_at": None,
+        "display_name": None,
+        "bio": None,
+        "date_of_birth": None,
+        "profile_image": None,
+        "gallery_images": None,
+        "gps_latitude": None,
+        "gps_longitude": None,
+        "gps_verified_at": None,
     }).eq("user_id", user["user_id"]).execute()
     return {"ok": True, "message": "Account deleted"}
 
@@ -306,8 +366,12 @@ def send_email(to_email: str, subject: str, body: str):
         "htmlContent": body,
     }
     try:
-        resp = httpx.post("https://api.brevo.com/v3/smtp/email", json=payload,
-                          headers={"api-key": brevo_api_key, "Content-Type": "application/json"}, timeout=10)
+        resp = httpx.post(
+            "https://api.brevo.com/v3/smtp/email",
+            json=payload,
+            headers={"api-key": brevo_api_key, "Content-Type": "application/json"},
+            timeout=10
+        )
         if resp.status_code not in (200, 201, 202):
             logger.error(f"Brevo error {resp.status_code}: {resp.text}")
     except Exception as e:
@@ -329,11 +393,13 @@ def signup_email(payload: dict, request: Request):
         if existing.get("deleted"):
             raise HTTPException(400, "Account with this email was deleted. Contact support.")
         raise HTTPException(400, "Email already registered")
+
     password_hash = bcrypt.hashpw(password[:72].encode("utf-8"), bcrypt.gensalt()).decode()
     user_id = f"user_{uuid.uuid4().hex[:12]}"
     now = datetime.now(timezone.utc).isoformat()
     verification_token = uuid.uuid4().hex
     verification_expires = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+
     sb.table("users").insert({
         "user_id": user_id, "email": email, "name": name,
         "password_hash": password_hash, "email_verified": False,
@@ -341,6 +407,7 @@ def signup_email(payload: dict, request: Request):
         "verification_token_expires": verification_expires,
         "created_at": now, "last_active": now,
     }).execute()
+
     verify_link = f"https://jwdate-e6fe5.web.app/verify-email?token={verification_token}"
     body = f"<h2>Welcome to CampusConnect!</h2><p>Click to verify: <a href='{verify_link}'>{verify_link}</a></p>"
     threading.Thread(target=send_email, args=(email, "Verify your email", body)).start()
@@ -359,6 +426,7 @@ def login_email(payload: dict, request: Request, response: Response):
         raise HTTPException(401, "Invalid credentials")
     if not user.get("email_verified"):
         raise HTTPException(403, "Email not verified. Check your inbox.")
+
     session_token = f"session_{uuid.uuid4().hex[:32]}"
     expires_at = datetime.now(timezone.utc) + timedelta(days=7)
     sb.table("user_sessions").upsert({
@@ -366,8 +434,12 @@ def login_email(payload: dict, request: Request, response: Response):
         "expires_at": expires_at.isoformat(), "created_at": datetime.now(timezone.utc).isoformat()
     }).execute()
     sb.table("users").update({"last_active": datetime.now(timezone.utc).isoformat()}).eq("user_id", user["user_id"]).execute()
-    response.set_cookie(key="session_token", value=session_token, httponly=True,
-                        secure=request.url.scheme == "https", samesite="lax", path="/", max_age=7*24*60*60)
+
+    response.set_cookie(
+        key="session_token", value=session_token,
+        httponly=True, secure=request.url.scheme == "https",
+        samesite="lax", path="/", max_age=7*24*60*60
+    )
     return {"ok": True, "user_id": user["user_id"], "token": session_token}
 
 @api_router.post("/auth/verify-email")
@@ -426,18 +498,28 @@ async def update_location(payload: LocationUpdatePayload, user: dict = Depends(g
         raise HTTPException(400, "Location accuracy too low (>500m).")
     now = datetime.now(timezone.utc)
     country, city = reverse_geocode(payload.latitude, payload.longitude)
+
     profile_data = {
-        "gps_latitude": payload.latitude, "gps_longitude": payload.longitude,
-        "gps_verified_at": now.isoformat(), "gps_accuracy": payload.accuracy,
-        "location_source": "gps", "latitude": payload.latitude, "longitude": payload.longitude,
-        "country": country, "city": city or "", "updated_at": now.isoformat(),
+        "gps_latitude": payload.latitude,
+        "gps_longitude": payload.longitude,
+        "gps_verified_at": now.isoformat(),
+        "gps_accuracy": payload.accuracy,
+        "location_source": "gps",
+        "latitude": payload.latitude,
+        "longitude": payload.longitude,
+        "country": country,
+        "city": city or "",
+        "updated_at": now.isoformat(),
     }
+
     existing = _maybe(sb.table("user_profiles").select("user_id").eq("user_id", user["user_id"]).maybe_single().execute())
     if existing:
         sb.table("user_profiles").update(profile_data).eq("user_id", user["user_id"]).execute()
     else:
-        profile_data["user_id"] = user["user_id"]; profile_data["created_at"] = now.isoformat()
+        profile_data["user_id"] = user["user_id"]
+        profile_data["created_at"] = now.isoformat()
         sb.table("user_profiles").insert(profile_data).execute()
+
     return {"ok": True, "latitude": payload.latitude, "longitude": payload.longitude, "country": country, "city": city}
 
 @api_router.get("/location/ip-fallback")
@@ -447,17 +529,22 @@ async def ip_fallback(request: Request, user: dict = Depends(get_current_user)):
     if location:
         now = datetime.now(timezone.utc)
         profile_data = {
-            "gps_latitude": location['latitude'], "gps_longitude": location['longitude'],
-            "gps_verified_at": now.isoformat(), "location_source": "ip",
-            "latitude": location['latitude'], "longitude": location['longitude'],
-            "country": location.get('country', ''), "city": location.get('city', ''),
+            "gps_latitude": location['latitude'],
+            "gps_longitude": location['longitude'],
+            "gps_verified_at": now.isoformat(),
+            "location_source": "ip",
+            "latitude": location['latitude'],
+            "longitude": location['longitude'],
+            "country": location.get('country', ''),
+            "city": location.get('city', ''),
             "updated_at": now.isoformat(),
         }
         existing = _maybe(sb.table("user_profiles").select("user_id").eq("user_id", user["user_id"]).maybe_single().execute())
         if existing:
             sb.table("user_profiles").update(profile_data).eq("user_id", user["user_id"]).execute()
         else:
-            profile_data["user_id"] = user["user_id"]; sb.table("user_profiles").insert(profile_data).execute()
+            profile_data["user_id"] = user["user_id"]
+            sb.table("user_profiles").insert(profile_data).execute()
         return {"ok": True, "latitude": location['latitude'], "longitude": location['longitude'],
                 "country": location.get('country'), "city": location.get('city'), "source": "ip"}
     return {"ok": False, "message": "Could not determine location from IP"}
@@ -501,7 +588,6 @@ def get_profile(user: dict) -> dict:
 
 @api_router.post("/profile/setup")
 async def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current_user)):
-    # Process images asynchronously
     profile_image = await process_image_field_async(payload.profile_image, user["user_id"], "profile")
     gallery = []
     for i, img in enumerate(payload.gallery_images or []):
@@ -516,9 +602,10 @@ async def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_c
         "onboarding_complete": True,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
+
     existing = _maybe(sb.table("user_profiles").select("user_id").eq("user_id", user["user_id"]).maybe_single().execute())
     if existing:
-        # Keep location if already set
+        # Preserve existing location if already set
         if existing.get("gps_latitude"):
             profile_data["gps_latitude"] = existing["gps_latitude"]
             profile_data["gps_longitude"] = existing["gps_longitude"]
@@ -528,6 +615,7 @@ async def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_c
     else:
         profile_data["created_at"] = datetime.now(timezone.utc).isoformat()
         sb.table("user_profiles").insert(profile_data).execute()
+
     return {"ok": True, "profile": get_profile(user)}
 
 @api_router.put("/profile")
@@ -536,6 +624,7 @@ async def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get
     for field in ["date_of_birth", "display_name"]:
         if getattr(payload, field, None) is not None:
             updates[field] = getattr(payload, field)
+
     if payload.profile_image is not None:
         updates["profile_image"] = await process_image_field_async(payload.profile_image, user["user_id"], "profile")
     if payload.gallery_images is not None:
@@ -543,16 +632,20 @@ async def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get
         for i, img in enumerate(payload.gallery_images):
             new_gallery.append(await process_image_field_async(img, user["user_id"], f"gallery_{i}"))
         updates["gallery_images"] = new_gallery
+
     if not updates:
         return {"ok": True, "profile": get_profile(user)}
+
     updates["updated_at"] = datetime.now(timezone.utc).isoformat()
     existing = _maybe(sb.table("user_profiles").select("user_id").eq("user_id", user["user_id"]).maybe_single().execute())
     if existing:
         sb.table("user_profiles").update(updates).eq("user_id", user["user_id"]).execute()
     else:
-        updates["user_id"] = user["user_id"]; updates["onboarding_complete"] = False
+        updates["user_id"] = user["user_id"]
+        updates["onboarding_complete"] = False
         updates["created_at"] = datetime.now(timezone.utc).isoformat()
         sb.table("user_profiles").insert(updates).execute()
+
     return {"ok": True, "profile": get_profile(user)}
 
 @api_router.get("/profile")
