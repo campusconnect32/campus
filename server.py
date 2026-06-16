@@ -1057,15 +1057,24 @@ def send_market_message(item_id: str, payload: MarketMessagePayload, user: dict 
     return {"ok": True, "message_id": message_id}
 
 @api_router.get("/marketplace/items/{item_id}/messages")
-def get_market_messages(item_id: str, user: dict = Depends(get_current_user)):
-    messages = sb.table("marketplace_messages")\
-        .select("*")\
-        .eq("item_id", item_id)\
-        .or_(f"sender_id.eq.{user['user_id']},receiver_id.eq.{user['user_id']}")\
-        .order("created_at", desc=False)\
-        .execute().data or []
+def get_market_messages(item_id: str, other_user_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    query = sb.table("marketplace_messages") \
+        .select("*") \
+        .eq("item_id", item_id)
 
-    # Enrich with sender's display name and profile picture
+    if other_user_id:
+        # Only messages between current user and the specified other user
+        query = query.or_(
+            f"and(sender_id.eq.{user['user_id']},receiver_id.eq.{other_user_id}),"
+            f"and(sender_id.eq.{other_user_id},receiver_id.eq.{user['user_id']})"
+        )
+    else:
+        # Fallback: all messages involving current user for this item (shouldn't normally be used)
+        query = query.or_(f"sender_id.eq.{user['user_id']},receiver_id.eq.{user['user_id']}")
+
+    messages = query.order("created_at", desc=False).execute().data or []
+
+    # Enrich with sender's display name and picture
     sender_ids = list({m["sender_id"] for m in messages})
     profiles = sb.table("user_profiles").select("user_id, display_name, profile_image").in_("user_id", sender_ids).execute().data or []
     pmap = {p["user_id"]: p for p in profiles}
