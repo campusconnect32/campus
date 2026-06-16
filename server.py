@@ -596,8 +596,8 @@ def get_profile(user: dict) -> dict:
 
 @api_router.post("/profile/setup")
 async def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current_user)):
-    # Validate compulsory fields
-    if not payload.gender or not payload.year_of_study or not payload.course or not payload.campus:
+    # Validate compulsory fields – reject empty or whitespace-only strings
+    if not payload.gender.strip() or not payload.year_of_study.strip() or not payload.course.strip() or not payload.campus.strip():
         raise HTTPException(400, "Gender, year of study, course, and campus are required")
 
     profile_image = await process_image_field_async(payload.profile_image, user["user_id"], "profile")
@@ -605,10 +605,9 @@ async def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_c
     for i, img in enumerate(payload.gallery_images or []):
         gallery.append(await process_image_field_async(img, user["user_id"], f"gallery_{i}"))
 
-    # Check if all required fields are present
     required_fields_present = bool(
-        payload.date_of_birth and payload.gender and
-        payload.year_of_study and payload.course and payload.campus
+        payload.date_of_birth and payload.gender.strip() and
+        payload.year_of_study.strip() and payload.course.strip() and payload.campus.strip()
     )
 
     profile_data = {
@@ -657,10 +656,8 @@ async def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get
     if not updates:
         return {"ok": True, "profile": get_profile(user)}
 
-    # After update, check if all required fields are now present to re-set onboarding
     existing = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
     current_profile = existing if existing else {}
-    # Merge existing values with updates
     for k in ["date_of_birth", "gender", "year_of_study", "course", "campus"]:
         if k in updates:
             current_profile[k] = updates[k]
@@ -691,7 +688,6 @@ def get_my_profile(user: dict = Depends(get_current_user)):
 
 # ---------- Mount router ----------
 app.include_router(api_router)
-
 
 if __name__ == "__main__":
     import uvicorn
