@@ -217,6 +217,13 @@ class TutorCreatePayload(BaseModel):
     price_range: str
     image: Optional[str] = ""
 
+class TutorUpdatePayload(BaseModel):
+    title: Optional[str] = None
+    course_name: Optional[str] = None
+    course_code: Optional[str] = None
+    price_range: Optional[str] = None
+    image: Optional[str] = None
+
 # ---------- Auth ----------
 async def get_current_user(
     request: Request,
@@ -733,6 +740,31 @@ def get_tutor(tutor_id: str):
     if not tutor:
         raise HTTPException(404, "Tutor not found")
     return tutor
+
+@api_router.put("/tutors/{tutor_id}")
+async def update_tutor(tutor_id: str, payload: TutorUpdatePayload, user: dict = Depends(get_current_user)):
+    tutor = _maybe(sb.table("tutors").select("*").eq("tutor_id", tutor_id).maybe_single().execute())
+    if not tutor:
+        raise HTTPException(404, "Tutor not found")
+    if tutor["user_id"] != user["user_id"]:
+        raise HTTPException(403, "You can only edit your own ads")
+    
+    updates = {}
+    for field in ["title", "course_name", "course_code", "price_range"]:
+        if getattr(payload, field, None) is not None:
+            val = getattr(payload, field).strip()
+            if field == "course_code":
+                val = val.upper()
+            updates[field] = val
+
+    if payload.image is not None:
+        updates["image"] = await process_image_field_async(payload.image, user["user_id"], "tutor")
+    
+    if updates:
+        updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+        sb.table("tutors").update(updates).eq("tutor_id", tutor_id).execute()
+    
+    return {"ok": True}
 
 @api_router.delete("/tutors/{tutor_id}")
 def delete_tutor(tutor_id: str, user: dict = Depends(get_current_user)):
