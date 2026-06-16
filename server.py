@@ -1009,6 +1009,13 @@ def delete_market_item(item_id: str, user: dict = Depends(get_current_user)):
     sb.table("marketplace_items").delete().eq("item_id", item_id).execute()
     return {"ok": True}
 
+@api_router.get("/marketplace/myitems/count")
+def my_market_items_count(user: dict = Depends(get_current_user)):
+    res = sb.table("marketplace_items").select("item_id", count="exact").eq("user_id", user["user_id"]).execute()
+    count = res.count if hasattr(res, 'count') else 0
+    return {"count": count}
+
+
 # ---------- Mount router ----------
 app.include_router(api_router)
 
