@@ -246,6 +246,29 @@ class MarketItemUpdatePayload(BaseModel):
 class MarketMessagePayload(BaseModel):
     content: str
 
+class ClubCreatePayload(BaseModel):
+    title: str
+    description: str = ""
+    image: Optional[str] = ""
+
+class ClubUpdatePayload(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    image: Optional[str] = None
+
+class JoinClubPayload(BaseModel):
+    proof_image: str
+
+class ClubMemberActionPayload(BaseModel):
+    role: Optional[str] = None
+    status: Optional[str] = None
+    suspend_hours: Optional[float] = None
+
+class ClubMessagePayload(BaseModel):
+    content: Optional[str] = ""
+    image: Optional[str] = ""
+    reply_to_id: Optional[str] = None
+
 # ---------- Auth ----------
 async def get_current_user(
     request: Request,
@@ -1063,18 +1086,16 @@ def get_market_messages(item_id: str, other_user_id: Optional[str] = None, user:
         .eq("item_id", item_id)
 
     if other_user_id:
-        # Only messages between current user and the specified other user
         query = query.or_(
             f"and(sender_id.eq.{user['user_id']},receiver_id.eq.{other_user_id}),"
             f"and(sender_id.eq.{other_user_id},receiver_id.eq.{user['user_id']})"
         )
     else:
-        # Fallback: all messages involving current user for this item (shouldn't normally be used)
         query = query.or_(f"sender_id.eq.{user['user_id']},receiver_id.eq.{user['user_id']}")
 
     messages = query.order("created_at", desc=False).execute().data or []
 
-    # Enrich with sender's display name and picture
+    # Enrich with sender info
     sender_ids = list({m["sender_id"] for m in messages})
     profiles = sb.table("user_profiles").select("user_id, display_name, profile_image").in_("user_id", sender_ids).execute().data or []
     pmap = {p["user_id"]: p for p in profiles}
@@ -1086,81 +1107,23 @@ def get_market_messages(item_id: str, other_user_id: Optional[str] = None, user:
 
 @api_router.get("/marketplace/my-customers")
 def get_my_customers(user: dict = Depends(get_current_user)):
-    # Get all messages where current user is the receiver (i.e. seller)
-    messages = sb.table("marketplace_messages") \
-        .select("message_id, item_id, sender_id, content, created_at") \
-        .eq("receiver_id", user["user_id"]) \
-        .order("created_at", desc=False) \
-        .execute().data or []
-
-    # Group by (item_id, sender_id) to get unique conversations
-    conv_map = {}
-    for m in messages:
-        key = (m["item_id"], m["sender_id"])
-        if key not in conv_map:
-            conv_map[key] = m
-        else:
-            # keep the latest message
-            if m["created_at"] > conv_map[key]["created_at"]:
-                conv_map[key] = m
-
-    conversations = list(conv_map.values())
-
-    if not conversations:
-        return []
-
-    # Get item titles
-    item_ids = list({c["item_id"] for c in conversations})
-    items = sb.table("marketplace_items").select("item_id, title").in_("item_id", item_ids).execute().data or []
-    item_map = {i["item_id"]: i["title"] for i in items}
-
-    # Get sender profiles
-    sender_ids = list({c["sender_id"] for c in conversations})
-    profiles = sb.table("user_profiles").select("user_id, display_name, profile_image").in_("user_id", sender_ids).execute().data or []
-    profile_map = {p["user_id"]: p for p in profiles}
-
-    result = []
-    for c in conversations:
-        sender = profile_map.get(c["sender_id"], {})
-        result.append({
-            "item_id": c["item_id"],
-            "item_title": item_map.get(c["item_id"], "Unknown item"),
-            "other_user_id": c["sender_id"],
-            "other_user_name": sender.get("display_name") or "Unknown",
-            "other_user_picture": sender.get("profile_image") or "",
-            "last_message": c["content"],
-            "last_message_time": c["created_at"],
-        })
-
-    # Sort most recent first
-    result.sort(key=lambda x: x["last_message_time"], reverse=True)
-    return result
-
-@api_router.get("/marketplace/my-customers")
-def get_my_customers(user: dict = Depends(get_current_user)):
-    # Get all messages where current user is the receiver (seller)
     messages = sb.table("marketplace_messages") \
         .select("sender_id") \
         .eq("receiver_id", user["user_id"]) \
         .execute().data or []
 
-    # Unique sender IDs
     sender_ids = list({m["sender_id"] for m in messages})
     if not sender_ids:
         return []
 
-    # Get profiles for these senders
     profiles = sb.table("user_profiles") \
         .select("user_id, display_name, profile_image") \
         .in_("user_id", sender_ids) \
         .execute().data or []
 
-    # For each customer, get the number of distinct items they've chatted about
-    # and the time of the most recent message (for sorting)
     result = []
     for p in profiles:
         cust_id = p["user_id"]
-        # Count distinct items
         item_count_res = sb.table("marketplace_messages") \
             .select("item_id", count="exact") \
             .eq("receiver_id", user["user_id"]) \
@@ -1168,7 +1131,6 @@ def get_my_customers(user: dict = Depends(get_current_user)):
             .execute()
         distinct_items = len({m["item_id"] for m in (item_count_res.data or [])}) if item_count_res.data else 0
 
-        # Most recent message time
         last_msg = sb.table("marketplace_messages") \
             .select("created_at") \
             .eq("receiver_id", user["user_id"]) \
@@ -1186,22 +1148,17 @@ def get_my_customers(user: dict = Depends(get_current_user)):
             "last_message_time": last_time,
         })
 
-    # Sort by most recent message descending
     result.sort(key=lambda x: x["last_message_time"] or "", reverse=True)
     return result
 
-
 @api_router.get("/marketplace/customers/{customer_id}/items")
 def get_customer_items(customer_id: str, user: dict = Depends(get_current_user)):
-    # Get all messages between seller (current user) and this customer,
-    # grouped by item_id, with the last message preview.
     msgs = sb.table("marketplace_messages") \
         .select("item_id, content, created_at") \
         .or_(f"and(sender_id.eq.{user['user_id']},receiver_id.eq.{customer_id}),and(sender_id.eq.{customer_id},receiver_id.eq.{user['user_id']})") \
         .order("created_at", desc=False) \
         .execute().data or []
 
-    # Group by item_id, collect all messages
     item_map = {}
     for m in msgs:
         iid = m["item_id"]
@@ -1209,14 +1166,13 @@ def get_customer_items(customer_id: str, user: dict = Depends(get_current_user))
             item_map[iid] = []
         item_map[iid].append(m)
 
-    # For each item, get the title
     item_ids = list(item_map.keys())
     items = sb.table("marketplace_items").select("item_id, title").in_("item_id", item_ids).execute().data or []
     title_map = {i["item_id"]: i["title"] for i in items}
 
     result = []
     for iid, messages in item_map.items():
-        last_msg = messages[-1]  # most recent
+        last_msg = messages[-1]
         result.append({
             "item_id": iid,
             "item_title": title_map.get(iid, "Unknown item"),
@@ -1225,9 +1181,269 @@ def get_customer_items(customer_id: str, user: dict = Depends(get_current_user))
             "message_count": len(messages),
         })
 
-    # Sort by latest message time
     result.sort(key=lambda x: x["last_message_time"], reverse=True)
     return result
+
+# ---------- Clubs & Societies ----------
+@api_router.post("/clubs")
+async def create_club(payload: ClubCreatePayload, user: dict = Depends(get_current_user)):
+    if not payload.title.strip():
+        raise HTTPException(400, "Title is required")
+
+    image_url = ""
+    if payload.image:
+        image_url = await process_image_field_async(payload.image, user["user_id"], "club")
+
+    club_id = f"club_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+
+    sb.table("clubs").insert({
+        "club_id": club_id,
+        "title": payload.title.strip(),
+        "description": payload.description.strip(),
+        "image": image_url,
+        "creator_id": user["user_id"],
+        "created_at": now,
+        "updated_at": now
+    }).execute()
+
+    member_id = f"mem_{uuid.uuid4().hex[:12]}"
+    sb.table("club_members").insert({
+        "member_id": member_id,
+        "club_id": club_id,
+        "user_id": user["user_id"],
+        "role": "admin",
+        "status": "approved",
+        "joined_at": now,
+        "created_at": now
+    }).execute()
+
+    return {"ok": True, "club_id": club_id}
+
+@api_router.get("/clubs")
+def list_clubs():
+    clubs = sb.table("clubs").select("*").order("created_at", desc=True).execute().data or []
+    for club in clubs:
+        cnt_res = sb.table("club_members").select("member_id", count="exact").eq("club_id", club["club_id"]).eq("status", "approved").execute()
+        club["member_count"] = cnt_res.count if hasattr(cnt_res, 'count') else 0
+    return clubs
+
+@api_router.get("/clubs/{club_id}")
+def get_club(club_id: str):
+    club = _maybe(sb.table("clubs").select("*").eq("club_id", club_id).maybe_single().execute())
+    if not club:
+        raise HTTPException(404, "Club not found")
+    cnt_res = sb.table("club_members").select("member_id", count="exact").eq("club_id", club_id).eq("status", "approved").execute()
+    club["member_count"] = cnt_res.count if hasattr(cnt_res, 'count') else 0
+    return club
+
+@api_router.put("/clubs/{club_id}")
+async def update_club(club_id: str, payload: ClubUpdatePayload, user: dict = Depends(get_current_user)):
+    club = _maybe(sb.table("clubs").select("*").eq("club_id", club_id).maybe_single().execute())
+    if not club:
+        raise HTTPException(404, "Club not found")
+    member = _maybe(sb.table("club_members").select("role").eq("club_id", club_id).eq("user_id", user["user_id"]).eq("status", "approved").maybe_single().execute())
+    if not member or member.get("role") != "admin":
+        raise HTTPException(403, "Only admins can edit")
+
+    updates = {}
+    if payload.title is not None: updates["title"] = payload.title.strip()
+    if payload.description is not None: updates["description"] = payload.description.strip()
+    if payload.image is not None:
+        updates["image"] = await process_image_field_async(payload.image, user["user_id"], "club")
+    if updates:
+        updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+        sb.table("clubs").update(updates).eq("club_id", club_id).execute()
+    return {"ok": True}
+
+@api_router.delete("/clubs/{club_id}")
+def delete_club(club_id: str, user: dict = Depends(get_current_user)):
+    club = _maybe(sb.table("clubs").select("*").eq("club_id", club_id).maybe_single().execute())
+    if not club:
+        raise HTTPException(404)
+    member = _maybe(sb.table("club_members").select("role").eq("club_id", club_id).eq("user_id", user["user_id"]).eq("status", "approved").maybe_single().execute())
+    if not member or member.get("role") != "admin":
+        raise HTTPException(403, "Only admins can delete")
+    sb.table("clubs").delete().eq("club_id", club_id).execute()
+    return {"ok": True}
+
+@api_router.post("/clubs/{club_id}/join")
+async def join_club(club_id: str, payload: JoinClubPayload, user: dict = Depends(get_current_user)):
+    club = _maybe(sb.table("clubs").select("*").eq("club_id", club_id).maybe_single().execute())
+    if not club:
+        raise HTTPException(404)
+    existing = _maybe(sb.table("club_members").select("member_id, status").eq("club_id", club_id).eq("user_id", user["user_id"]).maybe_single().execute())
+    if existing:
+        if existing["status"] == "approved":
+            raise HTTPException(400, "Already a member")
+        elif existing["status"] == "pending":
+            raise HTTPException(400, "Join request already pending")
+        else:
+            sb.table("club_members").delete().eq("member_id", existing["member_id"]).execute()
+
+    proof_url = ""
+    if payload.proof_image:
+        proof_url = await process_image_field_async(payload.proof_image, user["user_id"], "club_proof")
+
+    member_id = f"mem_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+    sb.table("club_members").insert({
+        "member_id": member_id,
+        "club_id": club_id,
+        "user_id": user["user_id"],
+        "role": "member",
+        "status": "pending",
+        "proof_image": proof_url,
+        "created_at": now
+    }).execute()
+    return {"ok": True, "member_id": member_id}
+
+@api_router.get("/clubs/{club_id}/members")
+def list_club_members(club_id: str, user: dict = Depends(get_current_user)):
+    club = _maybe(sb.table("clubs").select("*").eq("club_id", club_id).maybe_single().execute())
+    if not club:
+        raise HTTPException(404)
+    requester = _maybe(sb.table("club_members").select("role, status").eq("club_id", club_id).eq("user_id", user["user_id"]).maybe_single().execute())
+    is_admin = requester and requester.get("role") == "admin" and requester.get("status") == "approved"
+
+    query = sb.table("club_members").select("*").eq("club_id", club_id)
+    if not is_admin:
+        query = query.eq("status", "approved")
+    members = query.execute().data or []
+
+    user_ids = [m["user_id"] for m in members]
+    profiles = sb.table("user_profiles").select("user_id, display_name, profile_image").in_("user_id", user_ids).execute().data or []
+    pmap = {p["user_id"]: p for p in profiles}
+    for m in members:
+        p = pmap.get(m["user_id"], {})
+        m["display_name"] = p.get("display_name") or "Unknown"
+        m["profile_image"] = p.get("profile_image") or ""
+    return members
+
+@api_router.put("/clubs/{club_id}/members/{target_user_id}")
+async def update_member(club_id: str, target_user_id: str, payload: ClubMemberActionPayload, user: dict = Depends(get_current_user)):
+    club = _maybe(sb.table("clubs").select("*").eq("club_id", club_id).maybe_single().execute())
+    if not club:
+        raise HTTPException(404)
+    requester = _maybe(sb.table("club_members").select("role, status").eq("club_id", club_id).eq("user_id", user["user_id"]).eq("status", "approved").maybe_single().execute())
+    if not requester or requester.get("role") != "admin":
+        raise HTTPException(403, "Only admins can manage members")
+
+    target = _maybe(sb.table("club_members").select("*").eq("club_id", club_id).eq("user_id", target_user_id).maybe_single().execute())
+    if not target:
+        raise HTTPException(404, "Member not found")
+
+    updates = {}
+    if payload.role is not None:
+        if payload.role not in ("admin", "member"):
+            raise HTTPException(400, "Invalid role")
+        updates["role"] = payload.role
+    if payload.status is not None:
+        if payload.status not in ("approved", "rejected"):
+            raise HTTPException(400, "Invalid status")
+        updates["status"] = payload.status
+        if payload.status == "approved" and not target.get("joined_at"):
+            updates["joined_at"] = datetime.now(timezone.utc).isoformat()
+    if payload.suspend_hours is not None:
+        if payload.suspend_hours > 0:
+            updates["suspended_until"] = (datetime.now(timezone.utc) + timedelta(hours=payload.suspend_hours)).isoformat()
+        else:
+            updates["suspended_until"] = None
+
+    if updates:
+        sb.table("club_members").update(updates).eq("member_id", target["member_id"]).execute()
+    return {"ok": True}
+
+@api_router.delete("/clubs/{club_id}/members/{target_user_id}")
+def remove_member(club_id: str, target_user_id: str, user: dict = Depends(get_current_user)):
+    club = _maybe(sb.table("clubs").select("*").eq("club_id", club_id).maybe_single().execute())
+    if not club:
+        raise HTTPException(404)
+    requester = _maybe(sb.table("club_members").select("role, status").eq("club_id", club_id).eq("user_id", user["user_id"]).eq("status", "approved").maybe_single().execute())
+    if not requester or requester.get("role") != "admin":
+        raise HTTPException(403, "Only admins can remove members")
+    sb.table("club_members").delete().eq("club_id", club_id).eq("user_id", target_user_id).execute()
+    return {"ok": True}
+
+# ---------- Club Chat ----------
+@api_router.post("/clubs/{club_id}/messages")
+async def send_club_message(club_id: str, payload: ClubMessagePayload, user: dict = Depends(get_current_user)):
+    member = _maybe(sb.table("club_members").select("status, suspended_until").eq("club_id", club_id).eq("user_id", user["user_id"]).maybe_single().execute())
+    if not member or member.get("status") != "approved":
+        raise HTTPException(403, "You must be an approved member to chat")
+    if member.get("suspended_until"):
+        suspend = _parse_dt(member["suspended_until"])
+        if suspend and suspend > datetime.now(timezone.utc):
+            raise HTTPException(403, "You are suspended from this club")
+
+    if not payload.content.strip() and not payload.image:
+        raise HTTPException(400, "Message must contain text or an image")
+
+    image_url = ""
+    if payload.image:
+        image_url = await process_image_field_async(payload.image, user["user_id"], "club_msg")
+
+    if payload.reply_to_id:
+        reply_msg = _maybe(sb.table("club_messages").select("message_id").eq("message_id", payload.reply_to_id).maybe_single().execute())
+        if not reply_msg:
+            raise HTTPException(404, "Referenced message not found")
+
+    message_id = f"cmsg_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+    sb.table("club_messages").insert({
+        "message_id": message_id,
+        "club_id": club_id,
+        "sender_id": user["user_id"],
+        "content": payload.content.strip(),
+        "image": image_url,
+        "reply_to_id": payload.reply_to_id,
+        "created_at": now
+    }).execute()
+    return {"ok": True, "message_id": message_id}
+
+@api_router.get("/clubs/{club_id}/messages")
+def get_club_messages(club_id: str, limit: int = 50, before: Optional[str] = None, user: dict = Depends(get_current_user)):
+    member = _maybe(sb.table("club_members").select("status").eq("club_id", club_id).eq("user_id", user["user_id"]).eq("status", "approved").maybe_single().execute())
+    if not member:
+        raise HTTPException(403, "Only approved members can view messages")
+
+    query = sb.table("club_messages").select("*").eq("club_id", club_id).order("created_at", desc=True).limit(limit)
+    if before:
+        query = query.lt("created_at", before)
+    messages = query.execute().data or []
+    messages.reverse()
+
+    # Enrich sender and reply info
+    sender_ids = list({m["sender_id"] for m in messages})
+    profiles = sb.table("user_profiles").select("user_id, display_name, profile_image").in_("user_id", sender_ids).execute().data or []
+    pmap = {p["user_id"]: p for p in profiles}
+
+    # Pre-fetch reply-to messages
+    reply_ids = [m["reply_to_id"] for m in messages if m.get("reply_to_id")]
+    reply_map = {}
+    if reply_ids:
+        reply_msgs = sb.table("club_messages").select("message_id, content, sender_id").in_("message_id", reply_ids).execute().data or []
+        reply_profiles = sb.table("user_profiles").select("user_id, display_name, profile_image").in_("user_id", [rm["sender_id"] for rm in reply_msgs]).execute().data or []
+        rp_map = {p["user_id"]: p for p in reply_profiles}
+        for rm in reply_msgs:
+            rp = rp_map.get(rm["sender_id"], {})
+            reply_map[rm["message_id"]] = {
+                "message_id": rm["message_id"],
+                "content": rm["content"],
+                "sender_name": rp.get("display_name") or "Unknown",
+                "sender_picture": rp.get("profile_image") or ""
+            }
+
+    for m in messages:
+        p = pmap.get(m["sender_id"], {})
+        m["sender_name"] = p.get("display_name") or "Unknown"
+        m["sender_picture"] = p.get("profile_image") or ""
+        if m.get("reply_to_id") and m["reply_to_id"] in reply_map:
+            m["reply_to"] = reply_map[m["reply_to_id"]]
+        else:
+            m["reply_to"] = None
+
+    return messages
 
 # ---------- Mount router ----------
 app.include_router(api_router)
