@@ -1709,6 +1709,25 @@ def list_following(user: dict = Depends(get_current_user)):
         })
     return result
 
+@api_router.get("/users/discover")
+def discover_users(limit: int = 20, offset: int = 0, user: dict = Depends(get_current_user)):
+    # Get IDs of users already followed
+    followed = sb.table("user_follows").select("followed_id").eq("follower_id", user["user_id"]).execute().data or []
+    followed_ids = [f["followed_id"] for f in followed]
+    # Exclude self and followed users
+    exclude_ids = followed_ids + [user["user_id"]]
+
+    query = sb.table("user_profiles") \
+        .select("user_id, display_name, profile_image") \
+        .not_.in_("user_id", exclude_ids) \
+        .order("display_name") \
+        .limit(limit) \
+        .offset(offset)
+
+    profiles = query.execute().data or []
+    return profiles
+
+
 # ---------- Mount router ----------
 app.include_router(api_router)
 
