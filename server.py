@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, Cookie, Header
+from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, Cookie, Header, UploadFile, File
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -226,7 +226,7 @@ class TutorUpdatePayload(BaseModel):
     image: Optional[str] = None
 
 class TutorReviewPayload(BaseModel):
-    rating: int = 0          # 0 = no rating, 1-5 otherwise
+    rating: int = 0
     comment: str = ""
 
 class MarketItemCreatePayload(BaseModel):
@@ -280,6 +280,14 @@ class BursaryUpdatePayload(BaseModel):
     description: Optional[str] = None
     link: Optional[str] = None
     image: Optional[str] = None
+
+class CreateStatusPayload(BaseModel):
+    type: str
+    content: str = ""
+    media_url: Optional[str] = ""
+
+class FollowPayload(BaseModel):
+    user_id: str
 
 # ---------- Auth ----------
 async def get_current_user(
@@ -879,7 +887,6 @@ def create_tutor_review(tutor_id: str, payload: TutorReviewPayload, user: dict =
         raise HTTPException(400, "Rating must be between 1 and 5 if provided")
 
     if rating > 0:
-        # Rating: one per user → update if exists
         existing_rating = _maybe(sb.table("tutor_reviews")
             .select("review_id")
             .eq("tutor_id", tutor_id)
@@ -888,14 +895,12 @@ def create_tutor_review(tutor_id: str, payload: TutorReviewPayload, user: dict =
             .maybe_single().execute())
 
         if existing_rating:
-            # Update existing rating
             sb.table("tutor_reviews") \
                 .update({"rating": rating, "created_at": datetime.now(timezone.utc).isoformat()}) \
                 .eq("review_id", existing_rating["review_id"]) \
                 .execute()
             return {"ok": True, "review_id": existing_rating["review_id"], "updated": True}
         else:
-            # Insert new rating row (comment empty)
             review_id = f"rev_{uuid.uuid4().hex[:12]}"
             now = datetime.now(timezone.utc).isoformat()
             sb.table("tutor_reviews").insert({
@@ -908,7 +913,6 @@ def create_tutor_review(tutor_id: str, payload: TutorReviewPayload, user: dict =
             }).execute()
             return {"ok": True, "review_id": review_id}
     else:
-        # Chat message: always insert new row
         review_id = f"rev_{uuid.uuid4().hex[:12]}"
         now = datetime.now(timezone.utc).isoformat()
         sb.table("tutor_reviews").insert({
@@ -943,7 +947,6 @@ def list_tutor_reviews(tutor_id: str):
         })
     return enriched
 
-
 @api_router.get("/tutors/{tutor_id}/my-rating")
 def get_my_rating(tutor_id: str, user: dict = Depends(get_current_user)):
     review = _maybe(sb.table("tutor_reviews")
@@ -954,8 +957,6 @@ def get_my_rating(tutor_id: str, user: dict = Depends(get_current_user)):
         .maybe_single().execute())
     return {"rating": review["rating"] if review else 0}
 
-
-# ---------- My Ads Count ----------
 @api_router.get("/tutors/myads/count")
 def my_tutor_ads_count(user: dict = Depends(get_current_user)):
     res = sb.table("tutors").select("tutor_id", count="exact").eq("user_id", user["user_id"]).execute()
@@ -1004,7 +1005,6 @@ def list_market_items(category: Optional[str] = None):
         query = query.eq("category", category)
     items = query.execute().data or []
 
-    # --- Add seller info from user_profiles ---
     if items:
         seller_ids = list({item["user_id"] for item in items})
         profiles = sb.table("user_profiles") \
@@ -1107,7 +1107,6 @@ def get_market_messages(item_id: str, other_user_id: Optional[str] = None, user:
 
     messages = query.order("created_at", desc=False).execute().data or []
 
-    # Enrich with sender info
     sender_ids = list({m["sender_id"] for m in messages})
     profiles = sb.table("user_profiles").select("user_id, display_name, profile_image").in_("user_id", sender_ids).execute().data or []
     pmap = {p["user_id"]: p for p in profiles}
@@ -1119,7 +1118,6 @@ def get_market_messages(item_id: str, other_user_id: Optional[str] = None, user:
 
 @api_router.get("/marketplace/my-customers")
 def get_my_customers(user: dict = Depends(get_current_user)):
-    # Get all messages where current user is the receiver (seller)
     messages = sb.table("marketplace_messages") \
         .select("sender_id") \
         .eq("receiver_id", user["user_id"]) \
@@ -1426,7 +1424,6 @@ def get_club_messages(club_id: str, limit: int = 50, before: Optional[str] = Non
     messages = query.execute().data or []
     messages.reverse()
 
-    # Enrich sender info
     sender_ids = list({m["sender_id"] for m in messages})
     profiles = sb.table("user_profiles").select("user_id, display_name, profile_image").in_("user_id", sender_ids).execute().data or []
     pmap = {p["user_id"]: p for p in profiles}
@@ -1435,7 +1432,6 @@ def get_club_messages(club_id: str, limit: int = 50, before: Optional[str] = Non
         m["sender_name"] = p.get("display_name") or "Unknown"
         m["sender_picture"] = p.get("profile_image") or ""
         if m.get("reply_to_id"):
-            # resolve reply_to
             reply_msg = _maybe(sb.table("club_messages").select("content, sender_id").eq("message_id", m["reply_to_id"]).maybe_single().execute())
             if reply_msg:
                 rp = pmap.get(reply_msg["sender_id"], {})
@@ -1527,6 +1523,191 @@ def my_bursaries_count(user: dict = Depends(get_current_user)):
     res = sb.table("bursaries").select("bursary_id", count="exact").eq("user_id", user["user_id"]).execute()
     count = res.count if hasattr(res, 'count') else 0
     return {"count": count}
+
+# ---------- Stories ----------
+def cleanup_expired_statuses():
+    while True:
+        time.sleep(300)
+        try:
+            cutoff = datetime.now(timezone.utc).isoformat()
+            sb.table("statuses").delete().lte("expires_at", cutoff).execute()
+        except Exception as e:
+            logger.error(f"Cleanup expired statuses failed: {e}")
+
+threading.Thread(target=cleanup_expired_statuses, daemon=True).start()
+
+@api_router.post("/stories/upload")
+async def upload_story_file(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
+    allowed_types = ["image/jpeg", "image/png", "image/webp", "video/mp4", "video/quicktime"]
+    if file.content_type not in allowed_types:
+        raise HTTPException(400, "Unsupported file type")
+    contents = await file.read()
+    max_size = 30 * 1024 * 1024
+    if len(contents) > max_size:
+        raise HTTPException(400, "File too large (max 30 MB)")
+
+    if file.content_type.startswith("video"):
+        prefix = "story_vid"
+        filename = f"{prefix}_{uuid.uuid4().hex[:8]}.mp4"
+        path = f"{user['user_id']}/{filename}"
+        sb.storage.from_(STORAGE_BUCKET).upload(
+            path=path,
+            file=contents,
+            file_options={"content-type": file.content_type, "cache-control": "public, max-age=31536000, immutable"}
+        )
+        return {"url": f"{SUPABASE_URL}/storage/v1/object/public/{STORAGE_BUCKET}/{path}"}
+    else:
+        # Image: compress and upload
+        compressed = compress_image_sync(base64.b64encode(contents).decode(), max_size_kb=500)
+        loop = asyncio.get_running_loop()
+        prefix = "story_img"
+        filename = f"{prefix}_{uuid.uuid4().hex[:8]}.webp"
+        public_url = await loop.run_in_executor(None, upload_image_to_supabase_sync, compressed, user["user_id"], filename)
+        return {"url": public_url}
+
+@api_router.post("/stories")
+async def create_story(payload: CreateStatusPayload, user: dict = Depends(get_current_user)):
+    if payload.type not in ("text", "image", "video"):
+        raise HTTPException(400, "Invalid type")
+    if payload.type == "text" and not payload.content.strip():
+        raise HTTPException(400, "Text content required")
+    if payload.type in ("image", "video") and not payload.media_url:
+        raise HTTPException(400, "Media URL required")
+
+    status_id = f"st_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(hours=23)
+
+    sb.table("statuses").insert({
+        "status_id": status_id,
+        "user_id": user["user_id"],
+        "type": payload.type,
+        "content": payload.content.strip(),
+        "media": payload.media_url or "",
+        "created_at": now.isoformat(),
+        "expires_at": expires.isoformat()
+    }).execute()
+    return {"ok": True, "status_id": status_id}
+
+@api_router.get("/stories/feed")
+def get_story_feed(user: dict = Depends(get_current_user)):
+    follows = sb.table("user_follows").select("followed_id").eq("follower_id", user["user_id"]).execute().data or []
+    followed_ids = [f["followed_id"] for f in follows]
+    if not followed_ids:
+        return []
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    statuses = sb.table("statuses") \
+        .select("*") \
+        .in_("user_id", followed_ids) \
+        .gte("expires_at", now_iso) \
+        .order("created_at", desc=True) \
+        .execute().data or []
+
+    user_ids = list({s["user_id"] for s in statuses})
+    profiles = sb.table("user_profiles").select("user_id, display_name, profile_image").in_("user_id", user_ids).execute().data or []
+    pmap = {p["user_id"]: p for p in profiles}
+    for s in statuses:
+        p = pmap.get(s["user_id"], {})
+        s["display_name"] = p.get("display_name") or "Unknown"
+        s["profile_image"] = p.get("profile_image") or ""
+    return statuses
+
+@api_router.get("/stories/user/{user_id}")
+def get_user_stories(user_id: str):
+    now_iso = datetime.now(timezone.utc).isoformat()
+    statuses = sb.table("statuses") \
+        .select("*") \
+        .eq("user_id", user_id) \
+        .gte("expires_at", now_iso) \
+        .order("created_at", desc=True) \
+        .execute().data or []
+    return statuses
+
+@api_router.delete("/stories/{status_id}")
+def delete_story(status_id: str, user: dict = Depends(get_current_user)):
+    story = _maybe(sb.table("statuses").select("*").eq("status_id", status_id).maybe_single().execute())
+    if not story:
+        raise HTTPException(404, "Story not found")
+    if story["user_id"] != user["user_id"] and not user.get("is_admin"):
+        raise HTTPException(403, "Not allowed")
+    sb.table("statuses").delete().eq("status_id", status_id).execute()
+    return {"ok": True}
+
+# ---------- Follow / Unfollow ----------
+@api_router.post("/users/follow")
+def toggle_follow(payload: FollowPayload, user: dict = Depends(get_current_user)):
+    if payload.user_id == user["user_id"]:
+        raise HTTPException(400, "You cannot follow yourself")
+
+    existing = _maybe(sb.table("user_follows") \
+        .select("follow_id") \
+        .eq("follower_id", user["user_id"]) \
+        .eq("followed_id", payload.user_id) \
+        .maybe_single().execute())
+    if existing:
+        sb.table("user_follows").delete().eq("follow_id", existing["follow_id"]).execute()
+        return {"ok": True, "following": False}
+    else:
+        follow_id = f"fol_{uuid.uuid4().hex[:12]}"
+        sb.table("user_follows").insert({
+            "follow_id": follow_id,
+            "follower_id": user["user_id"],
+            "followed_id": payload.user_id
+        }).execute()
+        return {"ok": True, "following": True}
+
+@api_router.get("/users/search")
+def search_users(q: str, user: dict = Depends(get_current_user)):
+    if not q or len(q) < 2:
+        return []
+    profiles = sb.table("user_profiles") \
+        .select("user_id, display_name, profile_image") \
+        .ilike("display_name", f"%{q}%") \
+        .limit(20) \
+        .execute().data or []
+    users_by_email = sb.table("users") \
+        .select("user_id, name, picture") \
+        .ilike("email", f"%{q}%") \
+        .limit(20) \
+        .execute().data or []
+    seen = set()
+    result = []
+    for p in profiles:
+        if p["user_id"] not in seen and p["user_id"] != user["user_id"]:
+            seen.add(p["user_id"])
+            result.append({
+                "user_id": p["user_id"],
+                "display_name": p.get("display_name") or "Unknown",
+                "profile_image": p.get("profile_image") or ""
+            })
+    for u in users_by_email:
+        if u["user_id"] not in seen and u["user_id"] != user["user_id"]:
+            seen.add(u["user_id"])
+            result.append({
+                "user_id": u["user_id"],
+                "display_name": u.get("name") or "Unknown",
+                "profile_image": u.get("picture") or ""
+            })
+    return result[:30]
+
+@api_router.get("/users/following")
+def list_following(user: dict = Depends(get_current_user)):
+    follows = sb.table("user_follows").select("followed_id").eq("follower_id", user["user_id"]).execute().data or []
+    ids = [f["followed_id"] for f in follows]
+    if not ids:
+        return []
+    profiles = sb.table("user_profiles").select("user_id, display_name, profile_image").in_("user_id", ids).execute().data or []
+    pmap = {p["user_id"]: p for p in profiles}
+    result = []
+    for uid in ids:
+        p = pmap.get(uid, {})
+        result.append({
+            "user_id": uid,
+            "display_name": p.get("display_name") or "Unknown",
+            "profile_image": p.get("profile_image") or ""
+        })
+    return result
 
 # ---------- Mount router ----------
 app.include_router(api_router)
