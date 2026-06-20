@@ -428,7 +428,7 @@ async def delete_account(user: dict = Depends(get_current_user)):
 
 # ---------- Email / Password Auth ----------
 def send_email(to_email: str, subject: str, body: str):
-    brevo_api_key = os.environ.get("BREVO_API_KEY")
+    brevo_api_key = os.environ.get("BREVO_API_KE")
     if not brevo_api_key:
         logger.info(f"Email not sent (no API key): {to_email}")
         return
@@ -481,7 +481,7 @@ def signup_email(payload: dict, request: Request):
         "created_at": now, "last_active": now,
     }).execute()
 
-    verify_link = f"https://jwdate-e6fe5.web.app/verify-email?token={verification_token}"
+    verify_link = f"https://campusconnect-app-32.web.app//verify-email?token={verification_token}"
     body = f"<h2>Welcome to CampusConnect!</h2><p>Click to verify: <a href='{verify_link}'>{verify_link}</a></p>"
     threading.Thread(target=send_email, args=(email, "Verify your email", body)).start()
     return {"ok": True, "message": "Account created. Check your email."}
@@ -540,7 +540,7 @@ def forgot_password(payload: dict):
         sb.table("users").update({
             "reset_token": reset_token, "reset_token_expires": reset_expires
         }).eq("user_id", user["user_id"]).execute()
-        reset_link = f"https://jwdate-e6fe5.web.app/reset-password?token={reset_token}"
+        reset_link = f"campusconnect-app-32.web.app/reset-password?token={reset_token}"
         body = f"<h2>Password Reset</h2><p>Click to reset: <a href='{reset_link}'>{reset_link}</a></p>"
         threading.Thread(target=send_email, args=(email, "Reset your password", body)).start()
     return {"ok": True, "message": "If registered, a reset link has been sent."}
