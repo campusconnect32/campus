@@ -269,7 +269,6 @@ class ClubMessagePayload(BaseModel):
     image: Optional[str] = ""
     reply_to_id: Optional[str] = None
 
-
 class BursaryCreatePayload(BaseModel):
     title: str
     description: str = ""
@@ -281,7 +280,6 @@ class BursaryUpdatePayload(BaseModel):
     description: Optional[str] = None
     link: Optional[str] = None
     image: Optional[str] = None
-
 
 # ---------- Auth ----------
 async def get_current_user(
@@ -1121,6 +1119,7 @@ def get_market_messages(item_id: str, other_user_id: Optional[str] = None, user:
 
 @api_router.get("/marketplace/my-customers")
 def get_my_customers(user: dict = Depends(get_current_user)):
+    # Get all messages where current user is the receiver (seller)
     messages = sb.table("marketplace_messages") \
         .select("sender_id") \
         .eq("receiver_id", user["user_id"]) \
@@ -1427,40 +1426,30 @@ def get_club_messages(club_id: str, limit: int = 50, before: Optional[str] = Non
     messages = query.execute().data or []
     messages.reverse()
 
-    # Enrich sender and reply info
+    # Enrich sender info
     sender_ids = list({m["sender_id"] for m in messages})
     profiles = sb.table("user_profiles").select("user_id, display_name, profile_image").in_("user_id", sender_ids).execute().data or []
     pmap = {p["user_id"]: p for p in profiles}
-
-    # Pre-fetch reply-to messages
-    reply_ids = [m["reply_to_id"] for m in messages if m.get("reply_to_id")]
-    reply_map = {}
-    if reply_ids:
-        reply_msgs = sb.table("club_messages").select("message_id, content, sender_id").in_("message_id", reply_ids).execute().data or []
-        reply_profiles = sb.table("user_profiles").select("user_id, display_name, profile_image").in_("user_id", [rm["sender_id"] for rm in reply_msgs]).execute().data or []
-        rp_map = {p["user_id"]: p for p in reply_profiles}
-        for rm in reply_msgs:
-            rp = rp_map.get(rm["sender_id"], {})
-            reply_map[rm["message_id"]] = {
-                "message_id": rm["message_id"],
-                "content": rm["content"],
-                "sender_name": rp.get("display_name") or "Unknown",
-                "sender_picture": rp.get("profile_image") or ""
-            }
-
     for m in messages:
         p = pmap.get(m["sender_id"], {})
         m["sender_name"] = p.get("display_name") or "Unknown"
         m["sender_picture"] = p.get("profile_image") or ""
-        if m.get("reply_to_id") and m["reply_to_id"] in reply_map:
-            m["reply_to"] = reply_map[m["reply_to_id"]]
+        if m.get("reply_to_id"):
+            # resolve reply_to
+            reply_msg = _maybe(sb.table("club_messages").select("content, sender_id").eq("message_id", m["reply_to_id"]).maybe_single().execute())
+            if reply_msg:
+                rp = pmap.get(reply_msg["sender_id"], {})
+                m["reply_to"] = {
+                    "content": reply_msg["content"],
+                    "sender_name": rp.get("display_name") or "Unknown"
+                }
+            else:
+                m["reply_to"] = None
         else:
             m["reply_to"] = None
-
     return messages
 
 # ---------- Bursaries & Scholarships ----------
-
 @api_router.post("/bursaries")
 async def create_bursary(payload: BursaryCreatePayload, user: dict = Depends(get_current_user)):
     if not payload.title.strip():
@@ -1538,7 +1527,6 @@ def my_bursaries_count(user: dict = Depends(get_current_user)):
     res = sb.table("bursaries").select("bursary_id", count="exact").eq("user_id", user["user_id"]).execute()
     count = res.count if hasattr(res, 'count') else 0
     return {"count": count}
-
 
 # ---------- Mount router ----------
 app.include_router(api_router)
