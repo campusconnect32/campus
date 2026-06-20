@@ -269,6 +269,20 @@ class ClubMessagePayload(BaseModel):
     image: Optional[str] = ""
     reply_to_id: Optional[str] = None
 
+
+class BursaryCreatePayload(BaseModel):
+    title: str
+    description: str = ""
+    link: str = ""
+    image: Optional[str] = ""
+
+class BursaryUpdatePayload(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    link: Optional[str] = None
+    image: Optional[str] = None
+
+
 # ---------- Auth ----------
 async def get_current_user(
     request: Request,
@@ -1444,6 +1458,87 @@ def get_club_messages(club_id: str, limit: int = 50, before: Optional[str] = Non
             m["reply_to"] = None
 
     return messages
+
+# ---------- Bursaries & Scholarships ----------
+
+@api_router.post("/bursaries")
+async def create_bursary(payload: BursaryCreatePayload, user: dict = Depends(get_current_user)):
+    if not payload.title.strip():
+        raise HTTPException(400, "Title is required")
+
+    image_url = ""
+    if payload.image:
+        image_url = await process_image_field_async(payload.image, user["user_id"], "bursary")
+
+    bursary_id = f"bur_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+
+    sb.table("bursaries").insert({
+        "bursary_id": bursary_id,
+        "user_id": user["user_id"],
+        "title": payload.title.strip(),
+        "description": payload.description.strip(),
+        "link": payload.link.strip(),
+        "image": image_url,
+        "created_at": now,
+        "updated_at": now
+    }).execute()
+
+    return {"ok": True, "bursary_id": bursary_id}
+
+@api_router.get("/bursaries")
+def list_bursaries(search: Optional[str] = None):
+    query = sb.table("bursaries").select("*").order("created_at", desc=True)
+    if search:
+        query = query.or_(f"title.ilike.%{search}%,description.ilike.%{search}%")
+    bursaries = query.execute().data or []
+    return bursaries
+
+@api_router.get("/bursaries/{bursary_id}")
+def get_bursary(bursary_id: str):
+    bursary = _maybe(sb.table("bursaries").select("*").eq("bursary_id", bursary_id).maybe_single().execute())
+    if not bursary:
+        raise HTTPException(404, "Bursary not found")
+    return bursary
+
+@api_router.put("/bursaries/{bursary_id}")
+async def update_bursary(bursary_id: str, payload: BursaryUpdatePayload, user: dict = Depends(get_current_user)):
+    bursary = _maybe(sb.table("bursaries").select("*").eq("bursary_id", bursary_id).maybe_single().execute())
+    if not bursary:
+        raise HTTPException(404, "Bursary not found")
+    if bursary["user_id"] != user["user_id"] and not user.get("is_admin"):
+        raise HTTPException(403, "You can only edit your own posts")
+
+    updates = {}
+    for field in ["title", "description", "link"]:
+        if getattr(payload, field, None) is not None:
+            updates[field] = getattr(payload, field).strip()
+
+    if payload.image is not None:
+        updates["image"] = await process_image_field_async(payload.image, user["user_id"], "bursary")
+
+    if updates:
+        updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+        sb.table("bursaries").update(updates).eq("bursary_id", bursary_id).execute()
+
+    return {"ok": True}
+
+@api_router.delete("/bursaries/{bursary_id}")
+def delete_bursary(bursary_id: str, user: dict = Depends(get_current_user)):
+    bursary = _maybe(sb.table("bursaries").select("*").eq("bursary_id", bursary_id).maybe_single().execute())
+    if not bursary:
+        raise HTTPException(404, "Bursary not found")
+    if bursary["user_id"] != user["user_id"] and not user.get("is_admin"):
+        raise HTTPException(403, "You can only delete your own posts")
+    sb.table("bursaries").delete().eq("bursary_id", bursary_id).execute()
+    return {"ok": True}
+
+@api_router.get("/bursaries/my-count")
+def my_bursaries_count(user: dict = Depends(get_current_user)):
+    res = sb.table("bursaries").select("bursary_id", count="exact").eq("user_id", user["user_id"]).execute()
+    count = res.count if hasattr(res, 'count') else 0
+    return {"count": count}
+
 
 # ---------- Mount router ----------
 app.include_router(api_router)
