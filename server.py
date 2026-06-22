@@ -235,6 +235,7 @@ class MarketItemCreatePayload(BaseModel):
     price: str
     category: str
     image: Optional[str] = ""
+    images: Optional[List[str]] = []
 
 class MarketItemUpdatePayload(BaseModel):
     title: Optional[str] = None
@@ -242,6 +243,7 @@ class MarketItemUpdatePayload(BaseModel):
     price: Optional[str] = None
     category: Optional[str] = None
     image: Optional[str] = None
+    images: Optional[List[str]] = None
 
 class MarketMessagePayload(BaseModel):
     content: str
@@ -428,7 +430,7 @@ async def delete_account(user: dict = Depends(get_current_user)):
 
 # ---------- Email / Password Auth ----------
 def send_email(to_email: str, subject: str, body: str):
-    brevo_api_key = os.environ.get("BREVO_API_KE")
+    brevo_api_key = os.environ.get("BREVO_API_KEY")
     if not brevo_api_key:
         logger.info(f"Email not sent (no API key): {to_email}")
         return
@@ -481,7 +483,7 @@ def signup_email(payload: dict, request: Request):
         "created_at": now, "last_active": now,
     }).execute()
 
-    verify_link = f"https://campusconnect-app-32.web.app//verify-email?token={verification_token}"
+    verify_link = f"https://campusconnect-app-32.web.app/verify-email?token={verification_token}"
     body = f"<h2>Welcome to CampusConnect!</h2><p>Click to verify: <a href='{verify_link}'>{verify_link}</a></p>"
     threading.Thread(target=send_email, args=(email, "Verify your email", body)).start()
     return {"ok": True, "message": "Account created. Check your email."}
@@ -540,7 +542,7 @@ def forgot_password(payload: dict):
         sb.table("users").update({
             "reset_token": reset_token, "reset_token_expires": reset_expires
         }).eq("user_id", user["user_id"]).execute()
-        reset_link = f"campusconnect-app-32.web.app/reset-password?token={reset_token}"
+        reset_link = f"https://campusconnect-app-32.web.app/reset-password?token={reset_token}"
         body = f"<h2>Password Reset</h2><p>Click to reset: <a href='{reset_link}'>{reset_link}</a></p>"
         threading.Thread(target=send_email, args=(email, "Reset your password", body)).start()
     return {"ok": True, "message": "If registered, a reset link has been sent."}
@@ -798,7 +800,6 @@ def list_tutors(search: Optional[str] = None):
         query = query.ilike("course_code", f"%{search}%")
     tutors = query.execute().data or []
 
-    # Bulk compute average ratings
     if tutors:
         tutor_ids = [t["tutor_id"] for t in tutors]
         ratings = sb.table("tutor_reviews") \
@@ -830,7 +831,6 @@ def get_tutor(tutor_id: str):
     tutor = _maybe(sb.table("tutors").select("*").eq("tutor_id", tutor_id).maybe_single().execute())
     if not tutor:
         raise HTTPException(404, "Tutor not found")
-    # Calculate average rating
     rating_data = sb.table("tutor_reviews") \
         .select("rating") \
         .eq("tutor_id", tutor_id) \
@@ -964,22 +964,48 @@ def my_tutor_ads_count(user: dict = Depends(get_current_user)):
     return {"count": count}
 
 # ---------- Marketplace ----------
-MARKET_CATEGORIES = ["Products", "Services"]
+PRESET_CATEGORIES = [
+    "Electronics",
+    "Hair Products",
+    "Hair Services",
+    "Stationery",
+    "Health & Beauty",
+    "Clothing",
+    "Textbooks",
+    "Furniture",
+    "Food & Drinks",
+    "Art & Crafts",
+    "Services",
+    "Other"
+]
 
 @api_router.get("/marketplace/categories")
 def get_market_categories():
-    return MARKET_CATEGORIES
+    return PRESET_CATEGORIES
 
 @api_router.post("/marketplace/items")
 async def create_market_item(payload: MarketItemCreatePayload, user: dict = Depends(get_current_user)):
     if not payload.title.strip() or not payload.price.strip() or not payload.category.strip():
         raise HTTPException(400, "Title, price, and category are required")
-    if payload.category not in MARKET_CATEGORIES:
-        raise HTTPException(400, "Invalid category")
+    
+    # Allow any category (custom or preset)
+    category = payload.category.strip()
+    if len(category) > 0:
+        category = category[0].upper() + category[1:]
 
-    image_url = ""
-    if payload.image:
-        image_url = await process_image_field_async(payload.image, user["user_id"], "market")
+    # Process all images (up to 5)
+    image_urls = []
+    for i, img in enumerate(payload.images or []):
+        if img and len(image_urls) < 5:
+            url = await process_image_field_async(img, user["user_id"], f"market_{i}")
+            if url:
+                image_urls.append(url)
+
+    # Fallback: if single image provided and no array
+    if not image_urls and payload.image:
+        url = await process_image_field_async(payload.image, user["user_id"], "market")
+        if url:
+            image_urls = [url]
 
     item_id = f"item_{uuid.uuid4().hex[:12]}"
     now = datetime.now(timezone.utc).isoformat()
@@ -990,8 +1016,9 @@ async def create_market_item(payload: MarketItemCreatePayload, user: dict = Depe
         "title": payload.title.strip(),
         "description": payload.description.strip(),
         "price": payload.price.strip(),
-        "category": payload.category.strip(),
-        "image": image_url,
+        "category": category,
+        "image": image_urls[0] if image_urls else "",
+        "images": image_urls,
         "created_at": now,
         "updated_at": now
     }).execute()
@@ -999,10 +1026,12 @@ async def create_market_item(payload: MarketItemCreatePayload, user: dict = Depe
     return {"ok": True, "item_id": item_id}
 
 @api_router.get("/marketplace/items")
-def list_market_items(category: Optional[str] = None):
+def list_market_items(category: Optional[str] = None, search: Optional[str] = None):
     query = sb.table("marketplace_items").select("*").order("created_at", desc=True)
     if category:
         query = query.eq("category", category)
+    if search:
+        query = query.ilike("title", f"%{search}%")
     items = query.execute().data or []
 
     if items:
@@ -1018,6 +1047,8 @@ def list_market_items(category: Optional[str] = None):
             item["seller_phone"] = p.get("phone_number") or ""
             item["seller_country"] = p.get("country") or ""
             item["seller_city"] = p.get("city") or ""
+            if not item.get("images"):
+                item["images"] = [item["image"]] if item.get("image") else []
 
     return items
 
@@ -1040,11 +1071,21 @@ async def update_market_item(item_id: str, payload: MarketItemUpdatePayload, use
     for field in ["title", "description", "price", "category"]:
         if getattr(payload, field, None) is not None:
             val = getattr(payload, field).strip()
-            if field == "category" and val not in MARKET_CATEGORIES:
-                raise HTTPException(400, "Invalid category")
+            if field == "category" and len(val) > 0:
+                val = val[0].upper() + val[1:]
             updates[field] = val
 
-    if payload.image is not None:
+    if payload.images is not None:
+        image_urls = []
+        for i, img in enumerate(payload.images):
+            if img and len(image_urls) < 5:
+                url = await process_image_field_async(img, user["user_id"], f"market_{i}")
+                if url:
+                    image_urls.append(url)
+        updates["images"] = image_urls
+        updates["image"] = image_urls[0] if image_urls else ""
+
+    if payload.image is not None and payload.images is None:
         updates["image"] = await process_image_field_async(payload.image, user["user_id"], "market")
 
     if updates:
@@ -1557,7 +1598,6 @@ async def upload_story_file(file: UploadFile = File(...), user: dict = Depends(g
         )
         return {"url": f"{SUPABASE_URL}/storage/v1/object/public/{STORAGE_BUCKET}/{path}"}
     else:
-        # Image: compress and upload
         compressed = compress_image_sync(base64.b64encode(contents).decode(), max_size_kb=500)
         loop = asyncio.get_running_loop()
         prefix = "story_img"
@@ -1711,10 +1751,8 @@ def list_following(user: dict = Depends(get_current_user)):
 
 @api_router.get("/users/discover")
 def discover_users(limit: int = 20, offset: int = 0, user: dict = Depends(get_current_user)):
-    # Get IDs of users already followed
     followed = sb.table("user_follows").select("followed_id").eq("follower_id", user["user_id"]).execute().data or []
     followed_ids = [f["followed_id"] for f in followed]
-    # Exclude self and followed users
     exclude_ids = followed_ids + [user["user_id"]]
 
     query = sb.table("user_profiles") \
