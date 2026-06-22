@@ -276,12 +276,17 @@ class BursaryCreatePayload(BaseModel):
     description: str = ""
     link: str = ""
     image: Optional[str] = ""
+    faculties: List[str] = []
 
 class BursaryUpdatePayload(BaseModel):
     title: Optional[str] = None
     description: Optional[str] = None
     link: Optional[str] = None
     image: Optional[str] = None
+    faculties: Optional[List[str]] = None
+
+class BursaryMessagePayload(BaseModel):
+    content: str
 
 class CreateStatusPayload(BaseModel):
     type: str
@@ -988,12 +993,10 @@ async def create_market_item(payload: MarketItemCreatePayload, user: dict = Depe
     if not payload.title.strip() or not payload.price.strip() or not payload.category.strip():
         raise HTTPException(400, "Title, price, and category are required")
     
-    # Allow any category (custom or preset)
     category = payload.category.strip()
     if len(category) > 0:
         category = category[0].upper() + category[1:]
 
-    # Process all images (up to 5)
     image_urls = []
     for i, img in enumerate(payload.images or []):
         if img and len(image_urls) < 5:
@@ -1001,7 +1004,6 @@ async def create_market_item(payload: MarketItemCreatePayload, user: dict = Depe
             if url:
                 image_urls.append(url)
 
-    # Fallback: if single image provided and no array
     if not image_urls and payload.image:
         url = await process_image_field_async(payload.image, user["user_id"], "market")
         if url:
@@ -1487,6 +1489,21 @@ def get_club_messages(club_id: str, limit: int = 50, before: Optional[str] = Non
     return messages
 
 # ---------- Bursaries & Scholarships ----------
+FACULTIES = [
+    "Faculty of Humanities & Arts",
+    "Faculty of Science",
+    "Faculty of Commerce, Business & Management",
+    "Faculty of Engineering & Built Environment",
+    "Faculty of Health Sciences",
+    "Faculty of Law",
+    "Faculty of Education",
+    "Faculty of Agriculture & Veterinary Sciences",
+]
+
+@api_router.get("/bursaries/faculties")
+def get_faculties():
+    return FACULTIES
+
 @api_router.post("/bursaries")
 async def create_bursary(payload: BursaryCreatePayload, user: dict = Depends(get_current_user)):
     if not payload.title.strip():
@@ -1495,6 +1512,10 @@ async def create_bursary(payload: BursaryCreatePayload, user: dict = Depends(get
     image_url = ""
     if payload.image:
         image_url = await process_image_field_async(payload.image, user["user_id"], "bursary")
+
+    valid_faculties = [f for f in payload.faculties if f in FACULTIES]
+    if not valid_faculties:
+        valid_faculties = ["All"]
 
     bursary_id = f"bur_{uuid.uuid4().hex[:12]}"
     now = datetime.now(timezone.utc).isoformat()
@@ -1506,6 +1527,7 @@ async def create_bursary(payload: BursaryCreatePayload, user: dict = Depends(get
         "description": payload.description.strip(),
         "link": payload.link.strip(),
         "image": image_url,
+        "faculties": valid_faculties,
         "created_at": now,
         "updated_at": now
     }).execute()
@@ -1513,11 +1535,31 @@ async def create_bursary(payload: BursaryCreatePayload, user: dict = Depends(get
     return {"ok": True, "bursary_id": bursary_id}
 
 @api_router.get("/bursaries")
-def list_bursaries(search: Optional[str] = None):
+def list_bursaries(faculty: Optional[str] = None, search: Optional[str] = None):
     query = sb.table("bursaries").select("*").order("created_at", desc=True)
+
+    if faculty and faculty != "All":
+        query = query.contains("faculties", [faculty])
+
     if search:
         query = query.or_(f"title.ilike.%{search}%,description.ilike.%{search}%")
+
     bursaries = query.execute().data or []
+
+    if bursaries:
+        seller_ids = list({b["user_id"] for b in bursaries})
+        profiles = sb.table("user_profiles") \
+            .select("user_id, display_name, phone_number, country, city") \
+            .in_("user_id", seller_ids) \
+            .execute().data or []
+        profile_map = {p["user_id"]: p for p in profiles}
+        for b in bursaries:
+            p = profile_map.get(b["user_id"], {})
+            b["seller_name"] = p.get("display_name") or "Unknown"
+            b["seller_phone"] = p.get("phone_number") or ""
+            b["seller_country"] = p.get("country") or ""
+            b["seller_city"] = p.get("city") or ""
+
     return bursaries
 
 @api_router.get("/bursaries/{bursary_id}")
@@ -1539,6 +1581,10 @@ async def update_bursary(bursary_id: str, payload: BursaryUpdatePayload, user: d
     for field in ["title", "description", "link"]:
         if getattr(payload, field, None) is not None:
             updates[field] = getattr(payload, field).strip()
+
+    if payload.faculties is not None:
+        valid_faculties = [f for f in payload.faculties if f in FACULTIES]
+        updates["faculties"] = valid_faculties if valid_faculties else ["All"]
 
     if payload.image is not None:
         updates["image"] = await process_image_field_async(payload.image, user["user_id"], "bursary")
@@ -1564,6 +1610,53 @@ def my_bursaries_count(user: dict = Depends(get_current_user)):
     res = sb.table("bursaries").select("bursary_id", count="exact").eq("user_id", user["user_id"]).execute()
     count = res.count if hasattr(res, 'count') else 0
     return {"count": count}
+
+# ---------- Bursary Chat ----------
+@api_router.post("/bursaries/{bursary_id}/messages")
+def send_bursary_message(bursary_id: str, payload: BursaryMessagePayload, user: dict = Depends(get_current_user)):
+    bursary = _maybe(sb.table("bursaries").select("*").eq("bursary_id", bursary_id).maybe_single().execute())
+    if not bursary:
+        raise HTTPException(404, "Bursary not found")
+    receiver_id = bursary["user_id"]
+    if receiver_id == user["user_id"]:
+        raise HTTPException(400, "You cannot message yourself")
+
+    message_id = f"bmsg_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+    sb.table("bursary_messages").insert({
+        "message_id": message_id,
+        "bursary_id": bursary_id,
+        "sender_id": user["user_id"],
+        "receiver_id": receiver_id,
+        "content": payload.content.strip(),
+        "created_at": now
+    }).execute()
+    return {"ok": True, "message_id": message_id}
+
+@api_router.get("/bursaries/{bursary_id}/messages")
+def get_bursary_messages(bursary_id: str, other_user_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    query = sb.table("bursary_messages") \
+        .select("*") \
+        .eq("bursary_id", bursary_id)
+
+    if other_user_id:
+        query = query.or_(
+            f"and(sender_id.eq.{user['user_id']},receiver_id.eq.{other_user_id}),"
+            f"and(sender_id.eq.{other_user_id},receiver_id.eq.{user['user_id']})"
+        )
+    else:
+        query = query.or_(f"sender_id.eq.{user['user_id']},receiver_id.eq.{user['user_id']}")
+
+    messages = query.order("created_at", desc=False).execute().data or []
+
+    sender_ids = list({m["sender_id"] for m in messages})
+    profiles = sb.table("user_profiles").select("user_id, display_name, profile_image").in_("user_id", sender_ids).execute().data or []
+    pmap = {p["user_id"]: p for p in profiles}
+    for m in messages:
+        p = pmap.get(m["sender_id"], {})
+        m["sender_name"] = p.get("display_name") or "Unknown"
+        m["sender_picture"] = p.get("profile_image") or ""
+    return messages
 
 # ---------- Stories ----------
 def cleanup_expired_statuses():
