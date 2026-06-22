@@ -316,6 +316,21 @@ class NoteReviewPayload(BaseModel):
     rating: int = 0          # 0 = no rating, 1-5 otherwise
     comment: str = ""
 
+class LostFoundCreatePayload(BaseModel):
+    title: str
+    location: str = ""
+    left_at: str = ""
+    description: str = ""
+    contact: str = ""
+
+class LostFoundUpdatePayload(BaseModel):
+    title: Optional[str] = None
+    location: Optional[str] = None
+    left_at: Optional[str] = None
+    description: Optional[str] = None
+    contact: Optional[str] = None
+    status: Optional[str] = None
+
 # ---------- Auth ----------
 async def get_current_user(
     request: Request,
@@ -2056,6 +2071,72 @@ def get_my_note_rating(note_id: str, user: dict = Depends(get_current_user)):
     return {"rating": review["rating"] if review else 0}
 
 
+# ---------- Lost & Found ----------
+
+@api_router.post("/lost-found")
+def create_lost_found_item(payload: LostFoundCreatePayload, user: dict = Depends(get_current_user)):
+    if not payload.title.strip():
+        raise HTTPException(400, "Title is required")
+
+    item_id = f"lf_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+
+    sb.table("lost_found_items").insert({
+        "item_id": item_id,
+        "user_id": user["user_id"],
+        "title": payload.title.strip(),
+        "location": payload.location.strip(),
+        "left_at": payload.left_at.strip(),
+        "description": payload.description.strip(),
+        "contact": payload.contact.strip(),
+        "status": "found",
+        "created_at": now
+    }).execute()
+
+    return {"ok": True, "item_id": item_id}
+
+@api_router.get("/lost-found")
+def list_lost_found_items(search: Optional[str] = None):
+    query = sb.table("lost_found_items").select("*").order("created_at", desc=True)
+    if search:
+        query = query.or_(f"title.ilike.%{search}%,location.ilike.%{search}%")
+    items = query.execute().data or []
+    return items
+
+@api_router.get("/lost-found/{item_id}")
+def get_lost_found_item(item_id: str):
+    item = _maybe(sb.table("lost_found_items").select("*").eq("item_id", item_id).maybe_single().execute())
+    if not item:
+        raise HTTPException(404, "Item not found")
+    return item
+
+@api_router.put("/lost-found/{item_id}")
+def update_lost_found_item(item_id: str, payload: LostFoundUpdatePayload, user: dict = Depends(get_current_user)):
+    item = _maybe(sb.table("lost_found_items").select("*").eq("item_id", item_id).maybe_single().execute())
+    if not item:
+        raise HTTPException(404, "Item not found")
+    if item["user_id"] != user["user_id"] and not user.get("is_admin"):
+        raise HTTPException(403, "You can only edit your own reports")
+
+    updates = {}
+    for field in ["title", "location", "left_at", "description", "contact", "status"]:
+        if getattr(payload, field, None) is not None:
+            updates[field] = getattr(payload, field).strip()
+
+    if updates:
+        sb.table("lost_found_items").update(updates).eq("item_id", item_id).execute()
+
+    return {"ok": True}
+
+@api_router.delete("/lost-found/{item_id}")
+def delete_lost_found_item(item_id: str, user: dict = Depends(get_current_user)):
+    item = _maybe(sb.table("lost_found_items").select("*").eq("item_id", item_id).maybe_single().execute())
+    if not item:
+        raise HTTPException(404, "Item not found")
+    if item["user_id"] != user["user_id"] and not user.get("is_admin"):
+        raise HTTPException(403, "You can only delete your own reports")
+    sb.table("lost_found_items").delete().eq("item_id", item_id).execute()
+    return {"ok": True}
 
 # ---------- Mount router ----------
 app.include_router(api_router)
