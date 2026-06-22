@@ -296,6 +296,26 @@ class CreateStatusPayload(BaseModel):
 class FollowPayload(BaseModel):
     user_id: str
 
+class NoteCreatePayload(BaseModel):
+    title: str
+    course_name: str
+    course_code: str
+    price: str
+    description: str = ""
+    images: Optional[List[str]] = []
+
+class NoteUpdatePayload(BaseModel):
+    title: Optional[str] = None
+    course_name: Optional[str] = None
+    course_code: Optional[str] = None
+    price: Optional[str] = None
+    description: Optional[str] = None
+    images: Optional[List[str]] = None
+
+class NoteReviewPayload(BaseModel):
+    rating: int = 0          # 0 = no rating, 1-5 otherwise
+    comment: str = ""
+
 # ---------- Auth ----------
 async def get_current_user(
     request: Request,
@@ -1857,6 +1877,184 @@ def discover_users(limit: int = 20, offset: int = 0, user: dict = Depends(get_cu
 
     profiles = query.execute().data or []
     return profiles
+
+# ---------- Notes Guru ----------
+
+@api_router.post("/notes")
+async def create_note(payload: NoteCreatePayload, user: dict = Depends(get_current_user)):
+    if not payload.title.strip() or not payload.course_name.strip() or not payload.course_code.strip() or not payload.price.strip():
+        raise HTTPException(400, "All fields are required")
+
+    # Process images (up to 5)
+    image_urls = []
+    for i, img in enumerate(payload.images or []):
+        if img and len(image_urls) < 5:
+            url = await process_image_field_async(img, user["user_id"], f"note_{i}")
+            if url:
+                image_urls.append(url)
+
+    note_id = f"note_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+
+    sb.table("notes").insert({
+        "note_id": note_id,
+        "user_id": user["user_id"],
+        "title": payload.title.strip(),
+        "course_name": payload.course_name.strip(),
+        "course_code": payload.course_code.strip().upper(),
+        "price": payload.price.strip(),
+        "description": payload.description.strip(),
+        "images": image_urls,
+        "created_at": now,
+        "updated_at": now
+    }).execute()
+
+    return {"ok": True, "note_id": note_id}
+
+@api_router.get("/notes")
+def list_notes(search: Optional[str] = None):
+    query = sb.table("notes").select("*").order("created_at", desc=True)
+    if search:
+        query = query.ilike("course_code", f"%{search}%")
+    notes = query.execute().data or []
+
+    # Bulk compute average ratings
+    if notes:
+        note_ids = [n["note_id"] for n in notes]
+        ratings = sb.table("note_reviews") \
+            .select("note_id, rating") \
+            .in_("note_id", note_ids) \
+            .execute().data or []
+        rating_sums = defaultdict(int)
+        rating_counts = defaultdict(int)
+        for r in ratings:
+            if r["rating"] > 0:
+                rating_sums[r["note_id"]] += r["rating"]
+                rating_counts[r["note_id"]] += 1
+        for n in notes:
+            nid = n["note_id"]
+            cnt = rating_counts[nid]
+            n["average_rating"] = round(rating_sums[nid] / cnt, 1) if cnt else 0
+            n["rating_count"] = cnt
+    else:
+        for n in notes:
+            n["average_rating"] = 0
+            n["rating_count"] = 0
+
+    return notes
+
+@api_router.get("/notes/{note_id}")
+def get_note(note_id: str):
+    note = _maybe(sb.table("notes").select("*").eq("note_id", note_id).maybe_single().execute())
+    if not note:
+        raise HTTPException(404, "Note not found")
+    rating_data = sb.table("note_reviews").select("rating").eq("note_id", note_id).execute().data or []
+    valid_ratings = [r["rating"] for r in rating_data if r["rating"] > 0]
+    avg_rating = round(sum(valid_ratings) / len(valid_ratings), 1) if valid_ratings else 0
+    note["average_rating"] = avg_rating
+    note["rating_count"] = len(valid_ratings)
+    return note
+
+@api_router.put("/notes/{note_id}")
+async def update_note(note_id: str, payload: NoteUpdatePayload, user: dict = Depends(get_current_user)):
+    note = _maybe(sb.table("notes").select("*").eq("note_id", note_id).maybe_single().execute())
+    if not note:
+        raise HTTPException(404, "Note not found")
+    if note["user_id"] != user["user_id"] and not user.get("is_admin"):
+        raise HTTPException(403, "You can only edit your own ads")
+
+    updates = {}
+    for field in ["title", "course_name", "course_code", "price", "description"]:
+        if getattr(payload, field, None) is not None:
+            val = getattr(payload, field).strip()
+            if field == "course_code":
+                val = val.upper()
+            updates[field] = val
+
+    if payload.images is not None:
+        image_urls = []
+        for i, img in enumerate(payload.images):
+            if img and len(image_urls) < 5:
+                url = await process_image_field_async(img, user["user_id"], f"note_{i}")
+                if url:
+                    image_urls.append(url)
+        updates["images"] = image_urls
+
+    if updates:
+        updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+        sb.table("notes").update(updates).eq("note_id", note_id).execute()
+
+    return {"ok": True}
+
+@api_router.delete("/notes/{note_id}")
+def delete_note(note_id: str, user: dict = Depends(get_current_user)):
+    note = _maybe(sb.table("notes").select("*").eq("note_id", note_id).maybe_single().execute())
+    if not note:
+        raise HTTPException(404, "Note not found")
+    if note["user_id"] != user["user_id"] and not user.get("is_admin"):
+        raise HTTPException(403, "You can only delete your own ads")
+    sb.table("notes").delete().eq("note_id", note_id).execute()
+    return {"ok": True}
+
+@api_router.get("/notes/my-count")
+def my_notes_count(user: dict = Depends(get_current_user)):
+    res = sb.table("notes").select("note_id", count="exact").eq("user_id", user["user_id"]).execute()
+    count = res.count if hasattr(res, 'count') else 0
+    return {"count": count}
+
+# ---------- Note Reviews (identical pattern to tutor reviews) ----------
+@api_router.post("/notes/{note_id}/reviews")
+def create_note_review(note_id: str, payload: NoteReviewPayload, user: dict = Depends(get_current_user)):
+    note = _maybe(sb.table("notes").select("note_id").eq("note_id", note_id).maybe_single().execute())
+    if not note:
+        raise HTTPException(404, "Note not found")
+    rating = payload.rating
+    if rating > 0 and (rating < 1 or rating > 5):
+        raise HTTPException(400, "Rating must be between 1 and 5 if provided")
+
+    if rating > 0:
+        existing_rating = _maybe(sb.table("note_reviews")
+            .select("review_id")
+            .eq("note_id", note_id)
+            .eq("user_id", user["user_id"])
+            .gt("rating", 0)
+            .maybe_single().execute())
+        if existing_rating:
+            sb.table("note_reviews").update({"rating": rating, "created_at": datetime.now(timezone.utc).isoformat()}).eq("review_id", existing_rating["review_id"]).execute()
+            return {"ok": True, "review_id": existing_rating["review_id"], "updated": True}
+        else:
+            review_id = f"nrev_{uuid.uuid4().hex[:12]}"
+            now = datetime.now(timezone.utc).isoformat()
+            sb.table("note_reviews").insert({"review_id": review_id, "note_id": note_id, "user_id": user["user_id"], "rating": rating, "comment": "", "created_at": now}).execute()
+            return {"ok": True, "review_id": review_id}
+    else:
+        review_id = f"nrev_{uuid.uuid4().hex[:12]}"
+        now = datetime.now(timezone.utc).isoformat()
+        sb.table("note_reviews").insert({"review_id": review_id, "note_id": note_id, "user_id": user["user_id"], "rating": 0, "comment": payload.comment or "", "created_at": now}).execute()
+        return {"ok": True, "review_id": review_id}
+
+@api_router.get("/notes/{note_id}/reviews")
+def list_note_reviews(note_id: str):
+    reviews = sb.table("note_reviews")\
+        .select("review_id, note_id, user_id, rating, comment, created_at, users!inner(name, picture)")\
+        .eq("note_id", note_id).order("created_at", desc=True).execute().data or []
+    enriched = []
+    for r in reviews:
+        user = r.get("users", {})
+        enriched.append({
+            "review_id": r["review_id"], "note_id": r["note_id"], "user_id": r["user_id"],
+            "rating": r["rating"], "comment": r["comment"], "created_at": r["created_at"],
+            "user_name": user.get("name", "Unknown"), "user_picture": user.get("picture", "")
+        })
+    return enriched
+
+@api_router.get("/notes/{note_id}/my-rating")
+def get_my_note_rating(note_id: str, user: dict = Depends(get_current_user)):
+    review = _maybe(sb.table("note_reviews")
+        .select("rating")
+        .eq("note_id", note_id).eq("user_id", user["user_id"]).gt("rating", 0).maybe_single().execute())
+    return {"rating": review["rating"] if review else 0}
+
 
 
 # ---------- Mount router ----------
