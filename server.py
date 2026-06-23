@@ -3,8 +3,10 @@ from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
-import os, logging, uuid, math, httpx, asyncio, time, base64, bcrypt
+import os, logging, uuid, math, httpx, asyncio, time, base64, bcrypt, smtplib
 from pathlib import Path
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime, timezone, timedelta
@@ -359,11 +361,11 @@ async def get_current_user(
 # ---------- Root ----------
 @app.get("/")
 def root():
-    return {"message": "CampusConnect API is running"}
+    return {"message": "VarsityNetwork API is running"}
 
 @api_router.get("/")
 def api_root():
-    return {"message": "CampusConnect API v1"}
+    return {"message": "VarsityNetwork API v1"}
 
 # ---------- Authentication ----------
 @api_router.post("/auth/google")
@@ -468,29 +470,32 @@ async def delete_account(user: dict = Depends(get_current_user)):
     }).eq("user_id", user["user_id"]).execute()
     return {"ok": True, "message": "Account deleted"}
 
-# ---------- Email / Password Auth ----------
+# ---------- Email / Password Auth (SMTP) ----------
 def send_email(to_email: str, subject: str, body: str):
-    brevo_api_key = os.environ.get("BREVO_API_KEY")
-    if not brevo_api_key:
-        logger.info(f"Email not sent (no API key): {to_email}")
+    smtp_server = os.environ.get("SMTP_SERVER", "smtp-relay.brevo.com")
+    smtp_port = int(os.environ.get("SMTP_PORT", 587))
+    smtp_username = os.environ.get("SMTP_USERNAME")
+    smtp_password = os.environ.get("SMTP_PASSWORD")
+
+    if not all([smtp_server, smtp_port, smtp_username, smtp_password]):
+        logger.error("SMTP configuration missing. Check environment variables.")
         return
-    payload = {
-        "sender": {"name": "CampusConnect", "email": "noreply@campusconnect.com"},
-        "to": [{"email": to_email}],
-        "subject": subject,
-        "htmlContent": body,
-    }
+
+    # Use your verified domain sender
+    msg = MIMEMultipart()
+    msg["From"] = "VarsityNetwork <noreply@varsitynetwork.online>"
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "html"))
+
     try:
-        resp = httpx.post(
-            "https://api.brevo.com/v3/smtp/email",
-            json=payload,
-            headers={"api-key": brevo_api_key, "Content-Type": "application/json"},
-            timeout=10
-        )
-        if resp.status_code not in (200, 201, 202):
-            logger.error(f"Brevo error {resp.status_code}: {resp.text}")
+        with smtplib.SMTP(smtp_server, smtp_port) as server:
+            server.starttls()
+            server.login(smtp_username, smtp_password)
+            server.send_message(msg)
+        logger.info(f"Email sent to {to_email}")
     except Exception as e:
-        logger.error(f"Email send failed: {e}")
+        logger.error(f"Failed to send email to {to_email}: {e}")
 
 @api_router.post("/auth/signup")
 def signup_email(payload: dict, request: Request):
@@ -524,7 +529,7 @@ def signup_email(payload: dict, request: Request):
     }).execute()
 
     verify_link = f"https://campusconnect-app-32.web.app/verify-email?token={verification_token}"
-    body = f"<h2>Welcome to CampusConnect!</h2><p>Click to verify: <a href='{verify_link}'>{verify_link}</a></p>"
+    body = f"<h2>Welcome to VarsityNetwork!</h2><p>Click to verify: <a href='{verify_link}'>{verify_link}</a></p>"
     threading.Thread(target=send_email, args=(email, "Verify your email", body)).start()
     return {"ok": True, "message": "Account created. Check your email."}
 
@@ -1894,7 +1899,6 @@ def discover_users(limit: int = 20, offset: int = 0, user: dict = Depends(get_cu
     return profiles
 
 # ---------- Notes Guru ----------
-
 @api_router.post("/notes")
 async def create_note(payload: NoteCreatePayload, user: dict = Depends(get_current_user)):
     if not payload.title.strip() or not payload.course_name.strip() or not payload.course_code.strip() or not payload.price.strip():
@@ -2072,7 +2076,6 @@ def get_my_note_rating(note_id: str, user: dict = Depends(get_current_user)):
 
 
 # ---------- Lost & Found ----------
-
 @api_router.post("/lost-found")
 def create_lost_found_item(payload: LostFoundCreatePayload, user: dict = Depends(get_current_user)):
     if not payload.title.strip():
