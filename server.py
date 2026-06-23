@@ -352,6 +352,45 @@ class DirectionUpdatePayload(BaseModel):
     video_url: Optional[str] = None
 
 
+class AnnouncementCreatePayload(BaseModel):
+    title: str
+    category: str = "Notice"
+    department: str = ""
+    description: str = ""
+    status: str = "active"
+    priority: str = "medium"
+    expires_in: Optional[int] = None   # hours until expiration
+
+class AnnouncementUpdatePayload(BaseModel):
+    title: Optional[str] = None
+    category: Optional[str] = None
+    department: Optional[str] = None
+    description: Optional[str] = None
+    status: Optional[str] = None
+    priority: Optional[str] = None
+    expires_in: Optional[int] = None
+
+class EventCreatePayload(BaseModel):
+    title: str
+    category: str = "Other"
+    department: str = ""
+    description: str = ""
+    date: str = ""
+    time: str = ""
+    venue: str = ""
+    images: Optional[List[str]] = []
+
+class EventUpdatePayload(BaseModel):
+    title: Optional[str] = None
+    category: Optional[str] = None
+    department: Optional[str] = None
+    description: Optional[str] = None
+    date: Optional[str] = None
+    time: Optional[str] = None
+    venue: Optional[str] = None
+    images: Optional[List[str]] = None
+
+
 # ---------- Auth ----------
 async def get_current_user(
     request: Request,
@@ -2228,6 +2267,176 @@ def delete_direction(route_id: str, user: dict = Depends(get_current_user)):
         raise HTTPException(403, "You can only delete your own routes")
     sb.table("directions").delete().eq("route_id", route_id).execute()
     return {"ok": True}
+
+
+# ---------- Announcements ----------
+
+@api_router.post("/announcements")
+def create_announcement(payload: AnnouncementCreatePayload, user: dict = Depends(get_current_user)):
+    if not payload.title.strip():
+        raise HTTPException(400, "Title is required")
+
+    expires_at = None
+    if payload.expires_in and payload.expires_in > 0:
+        expires_at = (datetime.now(timezone.utc) + timedelta(hours=payload.expires_in)).isoformat()
+
+    announcement_id = f"ann_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+
+    sb.table("announcements").insert({
+        "announcement_id": announcement_id,
+        "user_id": user["user_id"],
+        "title": payload.title.strip(),
+        "category": payload.category.strip() or "Notice",
+        "department": payload.department.strip(),
+        "description": payload.description.strip(),
+        "status": payload.status.strip() or "active",
+        "priority": payload.priority.strip() or "medium",
+        "expires_at": expires_at,
+        "created_at": now
+    }).execute()
+
+    return {"ok": True, "announcement_id": announcement_id}
+
+@api_router.get("/announcements")
+def list_announcements(search: Optional[str] = None, status: Optional[str] = None):
+    query = sb.table("announcements").select("*").order("created_at", desc=True)
+    if status and status.lower() != "all":
+        query = query.eq("status", status.lower())
+    if search:
+        query = query.or_(f"title.ilike.%{search}%,department.ilike.%{search}%,description.ilike.%{search}%")
+    items = query.execute().data or []
+    return items
+
+@api_router.get("/announcements/{announcement_id}")
+def get_announcement(announcement_id: str):
+    announcement = _maybe(sb.table("announcements").select("*").eq("announcement_id", announcement_id).maybe_single().execute())
+    if not announcement:
+        raise HTTPException(404, "Announcement not found")
+    return announcement
+
+@api_router.put("/announcements/{announcement_id}")
+def update_announcement(announcement_id: str, payload: AnnouncementUpdatePayload, user: dict = Depends(get_current_user)):
+    announcement = _maybe(sb.table("announcements").select("*").eq("announcement_id", announcement_id).maybe_single().execute())
+    if not announcement:
+        raise HTTPException(404, "Announcement not found")
+    if announcement["user_id"] != user["user_id"] and not user.get("is_admin"):
+        raise HTTPException(403, "You can only edit your own announcements")
+
+    updates = {}
+    for field in ["title", "category", "department", "description", "status", "priority"]:
+        if getattr(payload, field, None) is not None:
+            updates[field] = getattr(payload, field).strip()
+
+    if payload.expires_in is not None:
+        if payload.expires_in > 0:
+            updates["expires_at"] = (datetime.now(timezone.utc) + timedelta(hours=payload.expires_in)).isoformat()
+        else:
+            updates["expires_at"] = None
+
+    if updates:
+        sb.table("announcements").update(updates).eq("announcement_id", announcement_id).execute()
+
+    return {"ok": True}
+
+@api_router.delete("/announcements/{announcement_id}")
+def delete_announcement(announcement_id: str, user: dict = Depends(get_current_user)):
+    announcement = _maybe(sb.table("announcements").select("*").eq("announcement_id", announcement_id).maybe_single().execute())
+    if not announcement:
+        raise HTTPException(404, "Announcement not found")
+    if announcement["user_id"] != user["user_id"] and not user.get("is_admin"):
+        raise HTTPException(403, "You can only delete your own announcements")
+    sb.table("announcements").delete().eq("announcement_id", announcement_id).execute()
+    return {"ok": True}
+
+# ---------- Events ----------
+
+@api_router.post("/events")
+async def create_event(payload: EventCreatePayload, user: dict = Depends(get_current_user)):
+    if not payload.title.strip():
+        raise HTTPException(400, "Title is required")
+
+    # Process images (up to 5)
+    image_urls = []
+    for i, img in enumerate(payload.images or []):
+        if img and len(image_urls) < 5:
+            url = await process_image_field_async(img, user["user_id"], f"event_{i}")
+            if url:
+                image_urls.append(url)
+
+    event_id = f"evt_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+
+    sb.table("events").insert({
+        "event_id": event_id,
+        "user_id": user["user_id"],
+        "title": payload.title.strip(),
+        "category": payload.category.strip() or "Other",
+        "department": payload.department.strip(),
+        "description": payload.description.strip(),
+        "date": payload.date.strip(),
+        "time": payload.time.strip(),
+        "venue": payload.venue.strip(),
+        "images": image_urls,
+        "created_at": now
+    }).execute()
+
+    return {"ok": True, "event_id": event_id}
+
+@api_router.get("/events")
+def list_events(search: Optional[str] = None, category: Optional[str] = None):
+    query = sb.table("events").select("*").order("created_at", desc=True)
+    if category and category.lower() != "all":
+        query = query.eq("category", category.lower())
+    if search:
+        query = query.or_(f"title.ilike.%{search}%,department.ilike.%{search}%")
+    events = query.execute().data or []
+    return events
+
+@api_router.get("/events/{event_id}")
+def get_event(event_id: str):
+    event = _maybe(sb.table("events").select("*").eq("event_id", event_id).maybe_single().execute())
+    if not event:
+        raise HTTPException(404, "Event not found")
+    return event
+
+@api_router.put("/events/{event_id}")
+async def update_event(event_id: str, payload: EventUpdatePayload, user: dict = Depends(get_current_user)):
+    event = _maybe(sb.table("events").select("*").eq("event_id", event_id).maybe_single().execute())
+    if not event:
+        raise HTTPException(404, "Event not found")
+    if event["user_id"] != user["user_id"] and not user.get("is_admin"):
+        raise HTTPException(403, "You can only edit your own events")
+
+    updates = {}
+    for field in ["title", "category", "department", "description", "date", "time", "venue"]:
+        if getattr(payload, field, None) is not None:
+            updates[field] = getattr(payload, field).strip()
+
+    if payload.images is not None:
+        image_urls = []
+        for i, img in enumerate(payload.images):
+            if img and len(image_urls) < 5:
+                url = await process_image_field_async(img, user["user_id"], f"event_{i}")
+                if url:
+                    image_urls.append(url)
+        updates["images"] = image_urls
+
+    if updates:
+        sb.table("events").update(updates).eq("event_id", event_id).execute()
+
+    return {"ok": True}
+
+@api_router.delete("/events/{event_id}")
+def delete_event(event_id: str, user: dict = Depends(get_current_user)):
+    event = _maybe(sb.table("events").select("*").eq("event_id", event_id).maybe_single().execute())
+    if not event:
+        raise HTTPException(404, "Event not found")
+    if event["user_id"] != user["user_id"] and not user.get("is_admin"):
+        raise HTTPException(403, "You can only delete your own events")
+    sb.table("events").delete().eq("event_id", event_id).execute()
+    return {"ok": True}
+
 
 # ---------- Mount router ----------
 app.include_router(api_router)
