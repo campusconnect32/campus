@@ -36,6 +36,8 @@ app.add_middleware(
     allow_origins=[
         "https://campusconnect-app-32.web.app",
         "https://campusconnect-app-32.firebaseapp.com",
+        "https://varsitynetwork.online",          # ← new domain
+        "https://www.varsitynetwork.online",      # ← optional www subdomain
         "http://localhost:3000",
     ],
     allow_credentials=True,
