@@ -335,6 +335,23 @@ class LostFoundUpdatePayload(BaseModel):
     contact: Optional[str] = None
     status: Optional[str] = None
 
+class DirectionCreatePayload(BaseModel):
+    from_location: str
+    to_location: str
+    duration: str = ""
+    mode: str = "walk"
+    description: str = ""
+    video_url: str = ""
+
+class DirectionUpdatePayload(BaseModel):
+    from_location: Optional[str] = None
+    to_location: Optional[str] = None
+    duration: Optional[str] = None
+    mode: Optional[str] = None
+    description: Optional[str] = None
+    video_url: Optional[str] = None
+
+
 # ---------- Auth ----------
 async def get_current_user(
     request: Request,
@@ -2141,6 +2158,75 @@ def delete_lost_found_item(item_id: str, user: dict = Depends(get_current_user))
     if item["user_id"] != user["user_id"] and not user.get("is_admin"):
         raise HTTPException(403, "You can only delete your own reports")
     sb.table("lost_found_items").delete().eq("item_id", item_id).execute()
+    return {"ok": True}
+
+
+
+# ---------- Campus Directions ----------
+
+@api_router.post("/directions")
+def create_direction(payload: DirectionCreatePayload, user: dict = Depends(get_current_user)):
+    if not payload.from_location.strip() or not payload.to_location.strip():
+        raise HTTPException(400, "From and To locations are required")
+
+    route_id = f"dir_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+
+    sb.table("directions").insert({
+        "route_id": route_id,
+        "user_id": user["user_id"],
+        "from_location": payload.from_location.strip(),
+        "to_location": payload.to_location.strip(),
+        "duration": payload.duration.strip(),
+        "mode": payload.mode.strip() or "walk",
+        "description": payload.description.strip(),
+        "video_url": payload.video_url.strip(),
+        "created_at": now
+    }).execute()
+
+    return {"ok": True, "route_id": route_id}
+
+@api_router.get("/directions")
+def list_directions(search: Optional[str] = None):
+    query = sb.table("directions").select("*").order("created_at", desc=True)
+    if search:
+        query = query.or_(f"from_location.ilike.%{search}%,to_location.ilike.%{search}%")
+    routes = query.execute().data or []
+    return routes
+
+@api_router.get("/directions/{route_id}")
+def get_direction(route_id: str):
+    route = _maybe(sb.table("directions").select("*").eq("route_id", route_id).maybe_single().execute())
+    if not route:
+        raise HTTPException(404, "Route not found")
+    return route
+
+@api_router.put("/directions/{route_id}")
+def update_direction(route_id: str, payload: DirectionUpdatePayload, user: dict = Depends(get_current_user)):
+    route = _maybe(sb.table("directions").select("*").eq("route_id", route_id).maybe_single().execute())
+    if not route:
+        raise HTTPException(404, "Route not found")
+    if route["user_id"] != user["user_id"] and not user.get("is_admin"):
+        raise HTTPException(403, "You can only edit your own routes")
+
+    updates = {}
+    for field in ["from_location", "to_location", "duration", "mode", "description", "video_url"]:
+        if getattr(payload, field, None) is not None:
+            updates[field] = getattr(payload, field).strip()
+
+    if updates:
+        sb.table("directions").update(updates).eq("route_id", route_id).execute()
+
+    return {"ok": True}
+
+@api_router.delete("/directions/{route_id}")
+def delete_direction(route_id: str, user: dict = Depends(get_current_user)):
+    route = _maybe(sb.table("directions").select("*").eq("route_id", route_id).maybe_single().execute())
+    if not route:
+        raise HTTPException(404, "Route not found")
+    if route["user_id"] != user["user_id"] and not user.get("is_admin"):
+        raise HTTPException(403, "You can only delete your own routes")
+    sb.table("directions").delete().eq("route_id", route_id).execute()
     return {"ok": True}
 
 # ---------- Mount router ----------
