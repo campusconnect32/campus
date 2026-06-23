@@ -2350,13 +2350,14 @@ def delete_announcement(announcement_id: str, user: dict = Depends(get_current_u
     return {"ok": True}
 
 # ---------- Events ----------
+# ---------- Events ----------
 
 @api_router.post("/events")
 async def create_event(payload: EventCreatePayload, user: dict = Depends(get_current_user)):
     if not payload.title.strip():
         raise HTTPException(400, "Title is required")
 
-    # Process images (up to 5)
+    # Process images (up to 5) — store full URLs in the database
     image_urls = []
     for i, img in enumerate(payload.images or []):
         if img and len(image_urls) < 5:
