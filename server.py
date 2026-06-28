@@ -527,31 +527,30 @@ async def delete_account(user: dict = Depends(get_current_user)):
     }).eq("user_id", user["user_id"]).execute()
     return {"ok": True, "message": "Account deleted"}
 
-# ---------- Email / Password Auth (Zoho SMTP) ----------
+# ---------- Email / Password Auth (Brevo HTTP API) ----------
 def send_email(to_email: str, subject: str, body: str):
-    # Default to Zoho SMTP settings
-    smtp_server = os.environ.get("SMTP_SERVER", "smtp.zoho.com")
-    smtp_port = int(os.environ.get("SMTP_PORT", 587))
-    smtp_username = os.environ.get("SMTP_USERNAME")
-    smtp_password = os.environ.get("SMTP_PASSWORD")
-
-    if not all([smtp_server, smtp_port, smtp_username, smtp_password]):
-        logger.error("SMTP configuration missing. Check environment variables.")
+    brevo_api_key = os.environ.get("BREVO_API_KEY")
+    if not brevo_api_key:
+        logger.error("BREVO_API_KEY missing – cannot send email")
         return
 
-    # Sender must match the authenticated Zoho mailbox
-    msg = MIMEMultipart()
-    msg["From"] = "VarsityNetwork <campus@varsitynetwork.online>"
-    msg["To"] = to_email
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "html"))
-
+    payload = {
+        "sender": {"name": "VarsityNetwork", "email": "campus@varsitynetwork.online"},
+        "to": [{"email": to_email}],
+        "subject": subject,
+        "htmlContent": body,
+    }
     try:
-        with smtplib.SMTP(smtp_server, smtp_port) as server:
-            server.starttls()
-            server.login(smtp_username, smtp_password)
-            server.send_message(msg)
-        logger.info(f"Email sent to {to_email}")
+        resp = httpx.post(
+            "https://api.brevo.com/v3/smtp/email",
+            json=payload,
+            headers={"api-key": brevo_api_key, "Content-Type": "application/json"},
+            timeout=10
+        )
+        if resp.status_code not in (200, 201, 202):
+            logger.error(f"Brevo error {resp.status_code}: {resp.text}")
+        else:
+            logger.info(f"Email sent to {to_email}")
     except Exception as e:
         logger.error(f"Failed to send email to {to_email}: {e}")
 
