@@ -36,8 +36,8 @@ app.add_middleware(
     allow_origins=[
         "https://campusconnect-app-32.web.app",
         "https://campusconnect-app-32.firebaseapp.com",
-        "https://varsitynetwork.online",          # ← new domain
-        "https://www.varsitynetwork.online",      # ← optional www subdomain
+        "https://varsitynetwork.online",
+        "https://www.varsitynetwork.online",
         "http://localhost:3000",
     ],
     allow_credentials=True,
@@ -351,7 +351,6 @@ class DirectionUpdatePayload(BaseModel):
     description: Optional[str] = None
     video_url: Optional[str] = None
 
-
 class AnnouncementCreatePayload(BaseModel):
     title: str
     category: str = "Notice"
@@ -359,7 +358,7 @@ class AnnouncementCreatePayload(BaseModel):
     description: str = ""
     status: str = "active"
     priority: str = "medium"
-    expires_in: Optional[int] = None   # hours until expiration
+    expires_in: Optional[int] = None
 
 class AnnouncementUpdatePayload(BaseModel):
     title: Optional[str] = None
@@ -528,9 +527,10 @@ async def delete_account(user: dict = Depends(get_current_user)):
     }).eq("user_id", user["user_id"]).execute()
     return {"ok": True, "message": "Account deleted"}
 
-# ---------- Email / Password Auth (SMTP) ----------
+# ---------- Email / Password Auth (Zoho SMTP) ----------
 def send_email(to_email: str, subject: str, body: str):
-    smtp_server = os.environ.get("SMTP_SERVER", "smtp-relay.brevo.com")
+    # Default to Zoho SMTP settings
+    smtp_server = os.environ.get("SMTP_SERVER", "smtp.zoho.com")
     smtp_port = int(os.environ.get("SMTP_PORT", 587))
     smtp_username = os.environ.get("SMTP_USERNAME")
     smtp_password = os.environ.get("SMTP_PASSWORD")
@@ -539,9 +539,9 @@ def send_email(to_email: str, subject: str, body: str):
         logger.error("SMTP configuration missing. Check environment variables.")
         return
 
-    # Use your verified domain sender
+    # Sender must match the authenticated Zoho mailbox
     msg = MIMEMultipart()
-    msg["From"] = "VarsityNetwork <noreply@varsitynetwork.online>"
+    msg["From"] = "VarsityNetwork <campus@varsitynetwork.online>"
     msg["To"] = to_email
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "html"))
@@ -1962,7 +1962,6 @@ async def create_note(payload: NoteCreatePayload, user: dict = Depends(get_curre
     if not payload.title.strip() or not payload.course_name.strip() or not payload.course_code.strip() or not payload.price.strip():
         raise HTTPException(400, "All fields are required")
 
-    # Process images (up to 5)
     image_urls = []
     for i, img in enumerate(payload.images or []):
         if img and len(image_urls) < 5:
@@ -1995,7 +1994,6 @@ def list_notes(search: Optional[str] = None):
         query = query.ilike("course_code", f"%{search}%")
     notes = query.execute().data or []
 
-    # Bulk compute average ratings
     if notes:
         note_ids = [n["note_id"] for n in notes]
         ratings = sb.table("note_reviews") \
@@ -2200,7 +2198,6 @@ def delete_lost_found_item(item_id: str, user: dict = Depends(get_current_user))
     return {"ok": True}
 
 
-
 # ---------- Campus Directions ----------
 
 @api_router.post("/directions")
@@ -2350,14 +2347,12 @@ def delete_announcement(announcement_id: str, user: dict = Depends(get_current_u
     return {"ok": True}
 
 # ---------- Events ----------
-# ---------- Events ----------
 
 @api_router.post("/events")
 async def create_event(payload: EventCreatePayload, user: dict = Depends(get_current_user)):
     if not payload.title.strip():
         raise HTTPException(400, "Title is required")
 
-    # Process images (up to 5) — store full URLs in the database
     image_urls = []
     for i, img in enumerate(payload.images or []):
         if img and len(image_urls) < 5:
