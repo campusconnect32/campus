@@ -716,25 +716,45 @@ def set_university(payload: dict, user: dict = Depends(get_current_user)):
     return {"ok": True, "university": {"id": uni["id"], "name": uni["name"], "short": uni["short"]}}
 
 # ---------- Admin endpoints ----------
+@api_router.get("/admin/universities")
+def admin_universities(user: dict = Depends(require_admin)):
+    return sb.table("universities").select("id,name,short").execute().data or []
+
 @api_router.get("/admin/stats")
-def admin_stats(user: dict = Depends(require_admin)):
-    def count(table, status=None):
+def admin_stats(university_id: Optional[str] = None, user: dict = Depends(require_admin)):
+    def count(table, status=None, uni_id=None):
         q = sb.table(table).select("*", count="exact")
         if status:
             q = q.eq("status", status)
+        if uni_id:
+            q = q.eq("university_id", uni_id)
         res = q.execute()
         return res.count if hasattr(res, 'count') else 0
 
     return {
-        "total_tutors": count("tutors"),
-        "pending_tutors": count("tutors", "pending"),
-        "approved_tutors": count("tutors", "approved"),
-        "total_bursaries": count("bursaries"),
-        "pending_bursaries": count("bursaries", "pending"),
-        "approved_bursaries": count("bursaries", "approved"),
-        "total_announcements": count("announcements"),
-        "total_events": count("events"),
+        "total_tutors": count("tutors", uni_id=university_id),
+        "pending_tutors": count("tutors", "pending", university_id),
+        "approved_tutors": count("tutors", "approved", university_id),
+        "total_bursaries": count("bursaries", uni_id=university_id),
+        "pending_bursaries": count("bursaries", "pending", university_id),
+        "approved_bursaries": count("bursaries", "approved", university_id),
+        "total_announcements": count("announcements", uni_id=university_id),
+        "total_events": count("events", uni_id=university_id),
     }
+
+@api_router.get("/admin/pending-tutors")
+def admin_pending_tutors(university_id: Optional[str] = None, user: dict = Depends(require_admin)):
+    q = sb.table("tutors").select("*").eq("status", "pending").order("created_at", desc=True)
+    if university_id:
+        q = q.eq("university_id", university_id)
+    return q.execute().data or []
+
+@api_router.get("/admin/pending-bursaries")
+def admin_pending_bursaries(university_id: Optional[str] = None, user: dict = Depends(require_admin)):
+    q = sb.table("bursaries").select("*").eq("status", "pending").order("created_at", desc=True)
+    if university_id:
+        q = q.eq("university_id", university_id)
+    return q.execute().data or []
 
 @api_router.put("/admin/tutors/{tutor_id}/approve")
 def admin_approve_tutor(tutor_id: str, user: dict = Depends(require_admin)):
