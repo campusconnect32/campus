@@ -46,7 +46,7 @@ app.add_middleware(
 )
 api_router = APIRouter(prefix="/api")
 
-# ---------- Rate limiter with cleanup ----------
+# ---------- Rate limiter ----------
 RATE_LIMIT_WINDOW = 60
 RATE_LIMIT_MAX = 10
 rate_limit_store: dict = {}
@@ -136,7 +136,7 @@ async def get_location_from_ip(ip: str) -> dict:
         logger.error(f"IP geolocation failed: {e}")
     return None
 
-# ---------- Image processing (non‑blocking) ----------
+# ---------- Image processing ----------
 def compress_image_sync(base64_str: str, max_size_kb: int = 300) -> bytes:
     if len(base64_str) > MAX_IMAGE_BASE64_SIZE:
         raise HTTPException(400, "Image too large (max 5 MB)")
@@ -194,7 +194,7 @@ class GoogleAuthPayload(BaseModel):
     name: str
     picture: str
     ref: Optional[str] = None
-    university_id: Optional[str] = None      # <-- new
+    university_id: Optional[str] = None
 
 class ProfileSetupPayload(BaseModel):
     date_of_birth: str
@@ -318,7 +318,7 @@ class NoteUpdatePayload(BaseModel):
     images: Optional[List[str]] = None
 
 class NoteReviewPayload(BaseModel):
-    rating: int = 0          # 0 = no rating, 1-5 otherwise
+    rating: int = 0
     comment: str = ""
 
 class LostFoundCreatePayload(BaseModel):
@@ -390,7 +390,6 @@ class EventUpdatePayload(BaseModel):
     venue: Optional[str] = None
     images: Optional[List[str]] = None
 
-
 # ---------- Auth ----------
 async def get_current_user(
     request: Request,
@@ -416,6 +415,11 @@ async def get_current_user(
     sb.table("users").update({"last_active": datetime.now(timezone.utc).isoformat()}).eq("user_id", user["user_id"]).execute()
     return user
 
+async def require_admin(user: dict = Depends(get_current_user)):
+    if not user.get("is_admin"):
+        raise HTTPException(403, "Admin access required")
+    return user
+
 # ---------- Root ----------
 @app.get("/")
 def root():
@@ -425,13 +429,12 @@ def root():
 def api_root():
     return {"message": "VarsityNetwork API v1"}
 
-# ---------- Email sending (Brevo) ----------
+# ---------- Email sending ----------
 def send_email(to_email: str, subject: str, body: str):
     brevo_api_key = os.environ.get("BREVO_API_KEY")
     if not brevo_api_key:
         logger.error("BREVO_API_KEY missing – cannot send email")
         return
-
     payload = {
         "sender": {"name": "VarsityNetwork", "email": "campus@varsitynetwork.online"},
         "to": [{"email": to_email}],
@@ -535,6 +538,7 @@ def auth_me(user: dict = Depends(get_current_user)):
         "needs_location": not has_gps or gps_stale,
         "created_at": user.get("created_at"),
         "university_id": user.get("university_id"),
+        "is_admin": user.get("is_admin", False),
     }
 
 @api_router.post("/accept-privacy")
@@ -710,6 +714,59 @@ def set_university(payload: dict, user: dict = Depends(get_current_user)):
         raise HTTPException(404, "University not found")
     sb.table("users").update({"university_id": university_id}).eq("user_id", user["user_id"]).execute()
     return {"ok": True, "university": {"id": uni["id"], "name": uni["name"], "short": uni["short"]}}
+
+# ---------- Admin endpoints ----------
+@api_router.get("/admin/stats")
+def admin_stats(user: dict = Depends(require_admin)):
+    def count(table, status=None):
+        q = sb.table(table).select("*", count="exact")
+        if status:
+            q = q.eq("status", status)
+        res = q.execute()
+        return res.count if hasattr(res, 'count') else 0
+
+    return {
+        "total_tutors": count("tutors"),
+        "pending_tutors": count("tutors", "pending"),
+        "approved_tutors": count("tutors", "approved"),
+        "total_bursaries": count("bursaries"),
+        "pending_bursaries": count("bursaries", "pending"),
+        "approved_bursaries": count("bursaries", "approved"),
+        "total_announcements": count("announcements"),
+        "total_events": count("events"),
+    }
+
+@api_router.put("/admin/tutors/{tutor_id}/approve")
+def admin_approve_tutor(tutor_id: str, user: dict = Depends(require_admin)):
+    tutor = _maybe(sb.table("tutors").select("*").eq("tutor_id", tutor_id).maybe_single().execute())
+    if not tutor:
+        raise HTTPException(404, "Tutor not found")
+    sb.table("tutors").update({"status": "approved"}).eq("tutor_id", tutor_id).execute()
+    return {"ok": True}
+
+@api_router.put("/admin/tutors/{tutor_id}/reject")
+def admin_reject_tutor(tutor_id: str, user: dict = Depends(require_admin)):
+    tutor = _maybe(sb.table("tutors").select("*").eq("tutor_id", tutor_id).maybe_single().execute())
+    if not tutor:
+        raise HTTPException(404, "Tutor not found")
+    sb.table("tutors").update({"status": "rejected", "rejection_reason": None}).eq("tutor_id", tutor_id).execute()
+    return {"ok": True}
+
+@api_router.put("/admin/bursaries/{bursary_id}/approve")
+def admin_approve_bursary(bursary_id: str, user: dict = Depends(require_admin)):
+    bursary = _maybe(sb.table("bursaries").select("*").eq("bursary_id", bursary_id).maybe_single().execute())
+    if not bursary:
+        raise HTTPException(404, "Bursary not found")
+    sb.table("bursaries").update({"status": "approved"}).eq("bursary_id", bursary_id).execute()
+    return {"ok": True}
+
+@api_router.put("/admin/bursaries/{bursary_id}/reject")
+def admin_reject_bursary(bursary_id: str, user: dict = Depends(require_admin)):
+    bursary = _maybe(sb.table("bursaries").select("*").eq("bursary_id", bursary_id).maybe_single().execute())
+    if not bursary:
+        raise HTTPException(404, "Bursary not found")
+    sb.table("bursaries").update({"status": "rejected", "rejection_reason": None}).eq("bursary_id", bursary_id).execute()
+    return {"ok": True}
 
 # ---------- Location ----------
 @api_router.post("/location/update")
