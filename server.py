@@ -194,6 +194,7 @@ class GoogleAuthPayload(BaseModel):
     name: str
     picture: str
     ref: Optional[str] = None
+    university_id: Optional[str] = None      # <-- new
 
 class ProfileSetupPayload(BaseModel):
     date_of_birth: str
@@ -389,12 +390,6 @@ class EventUpdatePayload(BaseModel):
     venue: Optional[str] = None
     images: Optional[List[str]] = None
 
-# ---------- New models for university verification ----------
-class StudentEmailPayload(BaseModel):
-    student_email: str
-
-class VerifyStudentEmailPayload(BaseModel):
-    token: str
 
 # ---------- Auth ----------
 async def get_current_user(
@@ -421,12 +416,6 @@ async def get_current_user(
     sb.table("users").update({"last_active": datetime.now(timezone.utc).isoformat()}).eq("user_id", user["user_id"]).execute()
     return user
 
-# ---------- Dependency: require student email verified ----------
-async def require_student_verification(user: dict = Depends(get_current_user)):
-    if not user.get("student_email_verified"):
-        raise HTTPException(status_code=403, detail="Student email not verified")
-    return user
-
 # ---------- Root ----------
 @app.get("/")
 def root():
@@ -436,11 +425,52 @@ def root():
 def api_root():
     return {"message": "VarsityNetwork API v1"}
 
+# ---------- Email sending (Brevo) ----------
+def send_email(to_email: str, subject: str, body: str):
+    brevo_api_key = os.environ.get("BREVO_API_KEY")
+    if not brevo_api_key:
+        logger.error("BREVO_API_KEY missing – cannot send email")
+        return
+
+    payload = {
+        "sender": {"name": "VarsityNetwork", "email": "campus@varsitynetwork.online"},
+        "to": [{"email": to_email}],
+        "subject": subject,
+        "htmlContent": body,
+    }
+    try:
+        resp = httpx.post(
+            "https://api.brevo.com/v3/smtp/email",
+            json=payload,
+            headers={"api-key": brevo_api_key, "Content-Type": "application/json"},
+            timeout=10
+        )
+        if resp.status_code not in (200, 201, 202):
+            logger.error(f"Brevo error {resp.status_code}: {resp.text}")
+        else:
+            logger.info(f"Email sent to {to_email}")
+    except Exception as e:
+        logger.error(f"Failed to send email to {to_email}: {e}")
+
+# ---------- Helper: validate university email ----------
+def validate_university_email(email: str, university_id: str):
+    uni = _maybe(sb.table("universities").select("*").eq("id", university_id).maybe_single().execute())
+    if not uni:
+        raise HTTPException(400, "University not found")
+    patterns = uni.get("email_patterns", [])
+    if not any(re.match(p, email) for p in patterns):
+        raise HTTPException(400, f"Email does not match the required format for {uni['name']}. Please use your student email.")
+
 # ---------- Authentication ----------
 @api_router.post("/auth/google")
 def auth_google(payload: GoogleAuthPayload, request: Request, response: Response):
     check_rate_limit(f"auth_{request.client.host}", max_req=5)
     email, name, picture = payload.email, payload.name, payload.picture
+    university_id = payload.university_id
+    if not university_id:
+        raise HTTPException(400, "University not selected. Please choose your university first.")
+    validate_university_email(email, university_id)
+
     session_token = f"session_{uuid.uuid4().hex[:32]}"
     now_iso = datetime.now(timezone.utc).isoformat()
 
@@ -448,7 +478,8 @@ def auth_google(payload: GoogleAuthPayload, request: Request, response: Response
     if existing:
         user_id = existing["user_id"]
         sb.table("users").update({
-            "name": name, "picture": picture, "last_active": now_iso, "deleted": False
+            "name": name, "picture": picture, "last_active": now_iso, "deleted": False,
+            "university_id": university_id
         }).eq("user_id", user_id).execute()
     else:
         deleted_user = _maybe(sb.table("users").select("*").eq("email", email).eq("deleted", True).maybe_single().execute())
@@ -457,12 +488,14 @@ def auth_google(payload: GoogleAuthPayload, request: Request, response: Response
                 raise HTTPException(403, "Your account has been banned.")
             user_id = deleted_user["user_id"]
             sb.table("users").update({
-                "name": name, "picture": picture, "last_active": now_iso, "deleted": False
+                "name": name, "picture": picture, "last_active": now_iso, "deleted": False,
+                "university_id": university_id
             }).eq("user_id", user_id).execute()
         else:
             user_id = f"user_{uuid.uuid4().hex[:12]}"
             sb.table("users").insert({
                 "user_id": user_id, "email": email, "name": name, "picture": picture,
+                "university_id": university_id,
                 "created_at": now_iso, "last_active": now_iso,
             }).execute()
 
@@ -502,8 +535,6 @@ def auth_me(user: dict = Depends(get_current_user)):
         "needs_location": not has_gps or gps_stale,
         "created_at": user.get("created_at"),
         "university_id": user.get("university_id"),
-        "student_email_verified": user.get("student_email_verified", False),
-        "student_email": user.get("student_email"),
     }
 
 @api_router.post("/accept-privacy")
@@ -542,38 +573,17 @@ async def delete_account(user: dict = Depends(get_current_user)):
     }).eq("user_id", user["user_id"]).execute()
     return {"ok": True, "message": "Account deleted"}
 
-# ---------- Email / Password Auth (Brevo HTTP API) ----------
-def send_email(to_email: str, subject: str, body: str):
-    brevo_api_key = os.environ.get("BREVO_API_KEY")
-    if not brevo_api_key:
-        logger.error("BREVO_API_KEY missing – cannot send email")
-        return
-
-    payload = {
-        "sender": {"name": "VarsityNetwork", "email": "campus@varsitynetwork.online"},
-        "to": [{"email": to_email}],
-        "subject": subject,
-        "htmlContent": body,
-    }
-    try:
-        resp = httpx.post(
-            "https://api.brevo.com/v3/smtp/email",
-            json=payload,
-            headers={"api-key": brevo_api_key, "Content-Type": "application/json"},
-            timeout=10
-        )
-        if resp.status_code not in (200, 201, 202):
-            logger.error(f"Brevo error {resp.status_code}: {resp.text}")
-        else:
-            logger.info(f"Email sent to {to_email}")
-    except Exception as e:
-        logger.error(f"Failed to send email to {to_email}: {e}")
-
+# ---------- Email / Password Auth ----------
 @api_router.post("/auth/signup")
 def signup_email(payload: dict, request: Request):
     email = payload.get("email", "").strip().lower()
     password = payload.get("password", "")
     name = payload.get("name", email.split("@")[0])
+    university_id = payload.get("university_id")
+    if not university_id:
+        raise HTTPException(400, "University not selected. Please choose your university first.")
+    validate_university_email(email, university_id)
+
     if not email or not password:
         raise HTTPException(400, "Email and password required")
     if len(password) < 6:
@@ -597,6 +607,7 @@ def signup_email(payload: dict, request: Request):
         "password_hash": password_hash, "email_verified": False,
         "verification_token": verification_token,
         "verification_token_expires": verification_expires,
+        "university_id": university_id,
         "created_at": now, "last_active": now,
     }).execute()
 
@@ -681,7 +692,7 @@ def reset_password(payload: dict):
     }).eq("user_id", user["user_id"]).execute()
     return {"ok": True, "message": "Password reset. You can now log in."}
 
-# ---------- University Selection & Verification ----------
+# ---------- University endpoints ----------
 @api_router.get("/universities")
 def list_universities():
     unis = sb.table("universities").select("id,name,short").execute().data
@@ -699,43 +710,6 @@ def set_university(payload: dict, user: dict = Depends(get_current_user)):
         raise HTTPException(404, "University not found")
     sb.table("users").update({"university_id": university_id}).eq("user_id", user["user_id"]).execute()
     return {"ok": True, "university": {"id": uni["id"], "name": uni["name"], "short": uni["short"]}}
-
-@api_router.post("/university/send-verification")
-def send_student_verification(payload: StudentEmailPayload, user: dict = Depends(get_current_user)):
-    email = payload.student_email.strip()
-    uni = _maybe(sb.table("universities").select("*").eq("id", user["university_id"]).maybe_single().execute())
-    if not uni:
-        raise HTTPException(400, "University not set")
-    patterns = uni.get("email_patterns", [])
-    if not any(re.match(p, email) for p in patterns):
-        raise HTTPException(400, f"Email does not match the student email format for {uni['name']}.")
-    token = uuid.uuid4().hex
-    expires = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
-    sb.table("users").update({
-        "student_email": email,
-        "student_email_verification_token": token,
-        "student_email_verification_token_expires": expires,
-    }).eq("user_id", user["user_id"]).execute()
-    verify_link = f"https://campusconnect-app-32.web.app/verify-student-email?token={token}"
-    body = f"<h2>Verify your student email for {uni['name']}</h2><p>Click to verify: <a href='{verify_link}'>{verify_link}</a></p>"
-    threading.Thread(target=send_email, args=(email, "Verify your student email", body)).start()
-    return {"ok": True, "message": "Verification email sent."}
-
-@api_router.post("/university/verify-email")
-def verify_student_email(payload: VerifyStudentEmailPayload, user: dict = Depends(get_current_user)):
-    token = payload.token
-    res = sb.table("users").select("user_id,student_email_verification_token_expires").eq("student_email_verification_token", token).maybe_single().execute()
-    entry = _maybe(res)
-    if not entry:
-        raise HTTPException(400, "Invalid token")
-    if _parse_dt(entry["student_email_verification_token_expires"]) < datetime.now(timezone.utc):
-        raise HTTPException(400, "Token expired")
-    sb.table("users").update({
-        "student_email_verified": True,
-        "student_email_verification_token": None,
-        "student_email_verification_token_expires": None,
-    }).eq("user_id", entry["user_id"]).execute()
-    return {"ok": True, "message": "Student email verified!"}
 
 # ---------- Location ----------
 @api_router.post("/location/update")
@@ -939,9 +913,9 @@ async def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get
 def get_my_profile(user: dict = Depends(get_current_user)):
     return get_profile(user)
 
-# ---------- Tutors (university-scoped) ----------
+# ---------- Tutors ----------
 @api_router.post("/tutors")
-async def create_tutor(payload: TutorCreatePayload, user: dict = Depends(require_student_verification)):
+async def create_tutor(payload: TutorCreatePayload, user: dict = Depends(get_current_user)):
     if not user.get("university_id"):
         raise HTTPException(400, "University not set")
     if not payload.title.strip() or not payload.course_name.strip() or not payload.course_code.strip() or not payload.price_range.strip():
@@ -970,7 +944,7 @@ async def create_tutor(payload: TutorCreatePayload, user: dict = Depends(require
     return {"ok": True, "tutor_id": tutor_id}
 
 @api_router.get("/tutors")
-def list_tutors(search: Optional[str] = None, user: dict = Depends(require_student_verification)):
+def list_tutors(search: Optional[str] = None, user: dict = Depends(get_current_user)):
     query = sb.table("tutors").select("*").eq("university_id", user["university_id"]).order("created_at", desc=True)
     if search:
         query = query.ilike("course_code", f"%{search}%")
@@ -998,7 +972,7 @@ def list_tutors(search: Optional[str] = None, user: dict = Depends(require_stude
     return tutors
 
 @api_router.get("/tutors/{tutor_id}")
-def get_tutor(tutor_id: str, user: dict = Depends(require_student_verification)):
+def get_tutor(tutor_id: str, user: dict = Depends(get_current_user)):
     tutor = _maybe(sb.table("tutors").select("*").eq("tutor_id", tutor_id).eq("university_id", user["university_id"]).maybe_single().execute())
     if not tutor:
         raise HTTPException(404, "Tutor not found")
@@ -1013,7 +987,7 @@ def get_tutor(tutor_id: str, user: dict = Depends(require_student_verification))
     return tutor
 
 @api_router.put("/tutors/{tutor_id}")
-async def update_tutor(tutor_id: str, payload: TutorUpdatePayload, user: dict = Depends(require_student_verification)):
+async def update_tutor(tutor_id: str, payload: TutorUpdatePayload, user: dict = Depends(get_current_user)):
     tutor = _maybe(sb.table("tutors").select("*").eq("tutor_id", tutor_id).eq("university_id", user["university_id"]).maybe_single().execute())
     if not tutor:
         raise HTTPException(404, "Tutor not found")
@@ -1038,7 +1012,7 @@ async def update_tutor(tutor_id: str, payload: TutorUpdatePayload, user: dict = 
     return {"ok": True}
 
 @api_router.delete("/tutors/{tutor_id}")
-def delete_tutor(tutor_id: str, user: dict = Depends(require_student_verification)):
+def delete_tutor(tutor_id: str, user: dict = Depends(get_current_user)):
     tutor = _maybe(sb.table("tutors").select("*").eq("tutor_id", tutor_id).eq("university_id", user["university_id"]).maybe_single().execute())
     if not tutor:
         raise HTTPException(404, "Tutor not found")
@@ -1049,7 +1023,7 @@ def delete_tutor(tutor_id: str, user: dict = Depends(require_student_verificatio
 
 # ---------- Tutor Reviews ----------
 @api_router.post("/tutors/{tutor_id}/reviews")
-def create_tutor_review(tutor_id: str, payload: TutorReviewPayload, user: dict = Depends(require_student_verification)):
+def create_tutor_review(tutor_id: str, payload: TutorReviewPayload, user: dict = Depends(get_current_user)):
     tutor = _maybe(sb.table("tutors").select("tutor_id").eq("tutor_id", tutor_id).eq("university_id", user["university_id"]).maybe_single().execute())
     if not tutor:
         raise HTTPException(404, "Tutor not found")
@@ -1097,7 +1071,7 @@ def create_tutor_review(tutor_id: str, payload: TutorReviewPayload, user: dict =
         return {"ok": True, "review_id": review_id}
 
 @api_router.get("/tutors/{tutor_id}/reviews")
-def list_tutor_reviews(tutor_id: str, user: dict = Depends(require_student_verification)):
+def list_tutor_reviews(tutor_id: str, user: dict = Depends(get_current_user)):
     reviews = sb.table("tutor_reviews")\
         .select("review_id, tutor_id, user_id, rating, comment, created_at, users!fk_review_user(name, picture)")\
         .eq("tutor_id", tutor_id)\
@@ -1119,7 +1093,7 @@ def list_tutor_reviews(tutor_id: str, user: dict = Depends(require_student_verif
     return enriched
 
 @api_router.get("/tutors/{tutor_id}/my-rating")
-def get_my_rating(tutor_id: str, user: dict = Depends(require_student_verification)):
+def get_my_rating(tutor_id: str, user: dict = Depends(get_current_user)):
     review = _maybe(sb.table("tutor_reviews")
         .select("rating")
         .eq("tutor_id", tutor_id)
@@ -1129,12 +1103,12 @@ def get_my_rating(tutor_id: str, user: dict = Depends(require_student_verificati
     return {"rating": review["rating"] if review else 0}
 
 @api_router.get("/tutors/myads/count")
-def my_tutor_ads_count(user: dict = Depends(require_student_verification)):
+def my_tutor_ads_count(user: dict = Depends(get_current_user)):
     res = sb.table("tutors").select("tutor_id", count="exact").eq("user_id", user["user_id"]).execute()
     count = res.count if hasattr(res, 'count') else 0
     return {"count": count}
 
-# ---------- Marketplace (university-scoped) ----------
+# ---------- Marketplace ----------
 PRESET_CATEGORIES = [
     "Electronics",
     "Hair Products",
@@ -1155,7 +1129,7 @@ def get_market_categories():
     return PRESET_CATEGORIES
 
 @api_router.post("/marketplace/items")
-async def create_market_item(payload: MarketItemCreatePayload, user: dict = Depends(require_student_verification)):
+async def create_market_item(payload: MarketItemCreatePayload, user: dict = Depends(get_current_user)):
     if not user.get("university_id"):
         raise HTTPException(400, "University not set")
     if not payload.title.strip() or not payload.price.strip() or not payload.category.strip():
@@ -1197,7 +1171,7 @@ async def create_market_item(payload: MarketItemCreatePayload, user: dict = Depe
     return {"ok": True, "item_id": item_id}
 
 @api_router.get("/marketplace/items")
-def list_market_items(category: Optional[str] = None, search: Optional[str] = None, user: dict = Depends(require_student_verification)):
+def list_market_items(category: Optional[str] = None, search: Optional[str] = None, user: dict = Depends(get_current_user)):
     query = sb.table("marketplace_items").select("*").eq("university_id", user["university_id"]).order("created_at", desc=True)
     if category:
         query = query.eq("category", category)
@@ -1224,14 +1198,14 @@ def list_market_items(category: Optional[str] = None, search: Optional[str] = No
     return items
 
 @api_router.get("/marketplace/items/{item_id}")
-def get_market_item(item_id: str, user: dict = Depends(require_student_verification)):
+def get_market_item(item_id: str, user: dict = Depends(get_current_user)):
     item = _maybe(sb.table("marketplace_items").select("*").eq("item_id", item_id).eq("university_id", user["university_id"]).maybe_single().execute())
     if not item:
         raise HTTPException(404, "Item not found")
     return item
 
 @api_router.put("/marketplace/items/{item_id}")
-async def update_market_item(item_id: str, payload: MarketItemUpdatePayload, user: dict = Depends(require_student_verification)):
+async def update_market_item(item_id: str, payload: MarketItemUpdatePayload, user: dict = Depends(get_current_user)):
     item = _maybe(sb.table("marketplace_items").select("*").eq("item_id", item_id).eq("university_id", user["university_id"]).maybe_single().execute())
     if not item:
         raise HTTPException(404, "Item not found")
@@ -1266,7 +1240,7 @@ async def update_market_item(item_id: str, payload: MarketItemUpdatePayload, use
     return {"ok": True}
 
 @api_router.delete("/marketplace/items/{item_id}")
-def delete_market_item(item_id: str, user: dict = Depends(require_student_verification)):
+def delete_market_item(item_id: str, user: dict = Depends(get_current_user)):
     item = _maybe(sb.table("marketplace_items").select("*").eq("item_id", item_id).eq("university_id", user["university_id"]).maybe_single().execute())
     if not item:
         raise HTTPException(404, "Item not found")
@@ -1276,14 +1250,14 @@ def delete_market_item(item_id: str, user: dict = Depends(require_student_verifi
     return {"ok": True}
 
 @api_router.get("/marketplace/myitems/count")
-def my_market_items_count(user: dict = Depends(require_student_verification)):
+def my_market_items_count(user: dict = Depends(get_current_user)):
     res = sb.table("marketplace_items").select("item_id", count="exact").eq("user_id", user["user_id"]).execute()
     count = res.count if hasattr(res, 'count') else 0
     return {"count": count}
 
 # ---------- Marketplace Private Chat ----------
 @api_router.post("/marketplace/items/{item_id}/messages")
-def send_market_message(item_id: str, payload: MarketMessagePayload, user: dict = Depends(require_student_verification)):
+def send_market_message(item_id: str, payload: MarketMessagePayload, user: dict = Depends(get_current_user)):
     item = _maybe(sb.table("marketplace_items").select("*").eq("item_id", item_id).eq("university_id", user["university_id"]).maybe_single().execute())
     if not item:
         raise HTTPException(404, "Item not found")
@@ -1304,7 +1278,7 @@ def send_market_message(item_id: str, payload: MarketMessagePayload, user: dict 
     return {"ok": True, "message_id": message_id}
 
 @api_router.get("/marketplace/items/{item_id}/messages")
-def get_market_messages(item_id: str, other_user_id: Optional[str] = None, user: dict = Depends(require_student_verification)):
+def get_market_messages(item_id: str, other_user_id: Optional[str] = None, user: dict = Depends(get_current_user)):
     query = sb.table("marketplace_messages") \
         .select("*") \
         .eq("item_id", item_id)
@@ -1329,7 +1303,7 @@ def get_market_messages(item_id: str, other_user_id: Optional[str] = None, user:
     return messages
 
 @api_router.get("/marketplace/my-customers")
-def get_my_customers(user: dict = Depends(require_student_verification)):
+def get_my_customers(user: dict = Depends(get_current_user)):
     messages = sb.table("marketplace_messages") \
         .select("sender_id") \
         .eq("receiver_id", user["user_id"]) \
@@ -1375,7 +1349,7 @@ def get_my_customers(user: dict = Depends(require_student_verification)):
     return result
 
 @api_router.get("/marketplace/customers/{customer_id}/items")
-def get_customer_items(customer_id: str, user: dict = Depends(require_student_verification)):
+def get_customer_items(customer_id: str, user: dict = Depends(get_current_user)):
     msgs = sb.table("marketplace_messages") \
         .select("item_id, content, created_at") \
         .or_(f"and(sender_id.eq.{user['user_id']},receiver_id.eq.{customer_id}),and(sender_id.eq.{customer_id},receiver_id.eq.{user['user_id']})") \
@@ -1407,9 +1381,9 @@ def get_customer_items(customer_id: str, user: dict = Depends(require_student_ve
     result.sort(key=lambda x: x["last_message_time"], reverse=True)
     return result
 
-# ---------- Clubs & Societies (university-scoped) ----------
+# ---------- Clubs & Societies ----------
 @api_router.post("/clubs")
-async def create_club(payload: ClubCreatePayload, user: dict = Depends(require_student_verification)):
+async def create_club(payload: ClubCreatePayload, user: dict = Depends(get_current_user)):
     if not user.get("university_id"):
         raise HTTPException(400, "University not set")
     if not payload.title.strip():
@@ -1447,7 +1421,7 @@ async def create_club(payload: ClubCreatePayload, user: dict = Depends(require_s
     return {"ok": True, "club_id": club_id}
 
 @api_router.get("/clubs")
-def list_clubs(user: dict = Depends(require_student_verification)):
+def list_clubs(user: dict = Depends(get_current_user)):
     clubs = sb.table("clubs").select("*").eq("university_id", user["university_id"]).order("created_at", desc=True).execute().data or []
     for club in clubs:
         cnt_res = sb.table("club_members").select("member_id", count="exact").eq("club_id", club["club_id"]).eq("status", "approved").execute()
@@ -1455,7 +1429,7 @@ def list_clubs(user: dict = Depends(require_student_verification)):
     return clubs
 
 @api_router.get("/clubs/{club_id}")
-def get_club(club_id: str, user: dict = Depends(require_student_verification)):
+def get_club(club_id: str, user: dict = Depends(get_current_user)):
     club = _maybe(sb.table("clubs").select("*").eq("club_id", club_id).eq("university_id", user["university_id"]).maybe_single().execute())
     if not club:
         raise HTTPException(404, "Club not found")
@@ -1464,7 +1438,7 @@ def get_club(club_id: str, user: dict = Depends(require_student_verification)):
     return club
 
 @api_router.put("/clubs/{club_id}")
-async def update_club(club_id: str, payload: ClubUpdatePayload, user: dict = Depends(require_student_verification)):
+async def update_club(club_id: str, payload: ClubUpdatePayload, user: dict = Depends(get_current_user)):
     club = _maybe(sb.table("clubs").select("*").eq("club_id", club_id).eq("university_id", user["university_id"]).maybe_single().execute())
     if not club:
         raise HTTPException(404, "Club not found")
@@ -1483,7 +1457,7 @@ async def update_club(club_id: str, payload: ClubUpdatePayload, user: dict = Dep
     return {"ok": True}
 
 @api_router.delete("/clubs/{club_id}")
-def delete_club(club_id: str, user: dict = Depends(require_student_verification)):
+def delete_club(club_id: str, user: dict = Depends(get_current_user)):
     club = _maybe(sb.table("clubs").select("*").eq("club_id", club_id).eq("university_id", user["university_id"]).maybe_single().execute())
     if not club:
         raise HTTPException(404)
@@ -1494,7 +1468,7 @@ def delete_club(club_id: str, user: dict = Depends(require_student_verification)
     return {"ok": True}
 
 @api_router.post("/clubs/{club_id}/join")
-async def join_club(club_id: str, payload: JoinClubPayload, user: dict = Depends(require_student_verification)):
+async def join_club(club_id: str, payload: JoinClubPayload, user: dict = Depends(get_current_user)):
     club = _maybe(sb.table("clubs").select("*").eq("club_id", club_id).eq("university_id", user["university_id"]).maybe_single().execute())
     if not club:
         raise HTTPException(404)
@@ -1525,7 +1499,7 @@ async def join_club(club_id: str, payload: JoinClubPayload, user: dict = Depends
     return {"ok": True, "member_id": member_id}
 
 @api_router.get("/clubs/{club_id}/members")
-def list_club_members(club_id: str, user: dict = Depends(require_student_verification)):
+def list_club_members(club_id: str, user: dict = Depends(get_current_user)):
     club = _maybe(sb.table("clubs").select("*").eq("club_id", club_id).eq("university_id", user["university_id"]).maybe_single().execute())
     if not club:
         raise HTTPException(404)
@@ -1547,7 +1521,7 @@ def list_club_members(club_id: str, user: dict = Depends(require_student_verific
     return members
 
 @api_router.put("/clubs/{club_id}/members/{target_user_id}")
-async def update_member(club_id: str, target_user_id: str, payload: ClubMemberActionPayload, user: dict = Depends(require_student_verification)):
+async def update_member(club_id: str, target_user_id: str, payload: ClubMemberActionPayload, user: dict = Depends(get_current_user)):
     club = _maybe(sb.table("clubs").select("*").eq("club_id", club_id).eq("university_id", user["university_id"]).maybe_single().execute())
     if not club:
         raise HTTPException(404)
@@ -1581,7 +1555,7 @@ async def update_member(club_id: str, target_user_id: str, payload: ClubMemberAc
     return {"ok": True}
 
 @api_router.delete("/clubs/{club_id}/members/{target_user_id}")
-def remove_member(club_id: str, target_user_id: str, user: dict = Depends(require_student_verification)):
+def remove_member(club_id: str, target_user_id: str, user: dict = Depends(get_current_user)):
     club = _maybe(sb.table("clubs").select("*").eq("club_id", club_id).eq("university_id", user["university_id"]).maybe_single().execute())
     if not club:
         raise HTTPException(404)
@@ -1593,7 +1567,7 @@ def remove_member(club_id: str, target_user_id: str, user: dict = Depends(requir
 
 # ---------- Club Chat ----------
 @api_router.post("/clubs/{club_id}/messages")
-async def send_club_message(club_id: str, payload: ClubMessagePayload, user: dict = Depends(require_student_verification)):
+async def send_club_message(club_id: str, payload: ClubMessagePayload, user: dict = Depends(get_current_user)):
     member = _maybe(sb.table("club_members").select("status, suspended_until").eq("club_id", club_id).eq("user_id", user["user_id"]).maybe_single().execute())
     if not member or member.get("status") != "approved":
         raise HTTPException(403, "You must be an approved member to chat")
@@ -1628,7 +1602,7 @@ async def send_club_message(club_id: str, payload: ClubMessagePayload, user: dic
     return {"ok": True, "message_id": message_id}
 
 @api_router.get("/clubs/{club_id}/messages")
-def get_club_messages(club_id: str, limit: int = 50, before: Optional[str] = None, user: dict = Depends(require_student_verification)):
+def get_club_messages(club_id: str, limit: int = 50, before: Optional[str] = None, user: dict = Depends(get_current_user)):
     member = _maybe(sb.table("club_members").select("status").eq("club_id", club_id).eq("user_id", user["user_id"]).eq("status", "approved").maybe_single().execute())
     if not member:
         raise HTTPException(403, "Only approved members can view messages")
@@ -1660,7 +1634,7 @@ def get_club_messages(club_id: str, limit: int = 50, before: Optional[str] = Non
             m["reply_to"] = None
     return messages
 
-# ---------- Bursaries & Scholarships (university-scoped) ----------
+# ---------- Bursaries & Scholarships ----------
 FACULTIES = [
     "Faculty of Humanities & Arts",
     "Faculty of Science",
@@ -1677,7 +1651,7 @@ def get_faculties():
     return FACULTIES
 
 @api_router.post("/bursaries")
-async def create_bursary(payload: BursaryCreatePayload, user: dict = Depends(require_student_verification)):
+async def create_bursary(payload: BursaryCreatePayload, user: dict = Depends(get_current_user)):
     if not user.get("university_id"):
         raise HTTPException(400, "University not set")
     if not payload.title.strip():
@@ -1710,7 +1684,7 @@ async def create_bursary(payload: BursaryCreatePayload, user: dict = Depends(req
     return {"ok": True, "bursary_id": bursary_id}
 
 @api_router.get("/bursaries")
-def list_bursaries(faculty: Optional[str] = None, search: Optional[str] = None, user: dict = Depends(require_student_verification)):
+def list_bursaries(faculty: Optional[str] = None, search: Optional[str] = None, user: dict = Depends(get_current_user)):
     query = sb.table("bursaries").select("*").eq("university_id", user["university_id"]).order("created_at", desc=True)
 
     if faculty and faculty != "All":
@@ -1738,14 +1712,14 @@ def list_bursaries(faculty: Optional[str] = None, search: Optional[str] = None, 
     return bursaries
 
 @api_router.get("/bursaries/{bursary_id}")
-def get_bursary(bursary_id: str, user: dict = Depends(require_student_verification)):
+def get_bursary(bursary_id: str, user: dict = Depends(get_current_user)):
     bursary = _maybe(sb.table("bursaries").select("*").eq("bursary_id", bursary_id).eq("university_id", user["university_id"]).maybe_single().execute())
     if not bursary:
         raise HTTPException(404, "Bursary not found")
     return bursary
 
 @api_router.put("/bursaries/{bursary_id}")
-async def update_bursary(bursary_id: str, payload: BursaryUpdatePayload, user: dict = Depends(require_student_verification)):
+async def update_bursary(bursary_id: str, payload: BursaryUpdatePayload, user: dict = Depends(get_current_user)):
     bursary = _maybe(sb.table("bursaries").select("*").eq("bursary_id", bursary_id).eq("university_id", user["university_id"]).maybe_single().execute())
     if not bursary:
         raise HTTPException(404, "Bursary not found")
@@ -1771,7 +1745,7 @@ async def update_bursary(bursary_id: str, payload: BursaryUpdatePayload, user: d
     return {"ok": True}
 
 @api_router.delete("/bursaries/{bursary_id}")
-def delete_bursary(bursary_id: str, user: dict = Depends(require_student_verification)):
+def delete_bursary(bursary_id: str, user: dict = Depends(get_current_user)):
     bursary = _maybe(sb.table("bursaries").select("*").eq("bursary_id", bursary_id).eq("university_id", user["university_id"]).maybe_single().execute())
     if not bursary:
         raise HTTPException(404, "Bursary not found")
@@ -1781,14 +1755,14 @@ def delete_bursary(bursary_id: str, user: dict = Depends(require_student_verific
     return {"ok": True}
 
 @api_router.get("/bursaries/my-count")
-def my_bursaries_count(user: dict = Depends(require_student_verification)):
+def my_bursaries_count(user: dict = Depends(get_current_user)):
     res = sb.table("bursaries").select("bursary_id", count="exact").eq("user_id", user["user_id"]).execute()
     count = res.count if hasattr(res, 'count') else 0
     return {"count": count}
 
 # ---------- Bursary Chat ----------
 @api_router.post("/bursaries/{bursary_id}/messages")
-def send_bursary_message(bursary_id: str, payload: BursaryMessagePayload, user: dict = Depends(require_student_verification)):
+def send_bursary_message(bursary_id: str, payload: BursaryMessagePayload, user: dict = Depends(get_current_user)):
     bursary = _maybe(sb.table("bursaries").select("*").eq("bursary_id", bursary_id).eq("university_id", user["university_id"]).maybe_single().execute())
     if not bursary:
         raise HTTPException(404, "Bursary not found")
@@ -1809,7 +1783,7 @@ def send_bursary_message(bursary_id: str, payload: BursaryMessagePayload, user: 
     return {"ok": True, "message_id": message_id}
 
 @api_router.get("/bursaries/{bursary_id}/messages")
-def get_bursary_messages(bursary_id: str, other_user_id: Optional[str] = None, user: dict = Depends(require_student_verification)):
+def get_bursary_messages(bursary_id: str, other_user_id: Optional[str] = None, user: dict = Depends(get_current_user)):
     query = sb.table("bursary_messages") \
         .select("*") \
         .eq("bursary_id", bursary_id)
@@ -1833,7 +1807,7 @@ def get_bursary_messages(bursary_id: str, other_user_id: Optional[str] = None, u
         m["sender_picture"] = p.get("profile_image") or ""
     return messages
 
-# ---------- Stories (university-scoped) ----------
+# ---------- Stories ----------
 def cleanup_expired_statuses():
     while True:
         time.sleep(300)
@@ -1846,7 +1820,7 @@ def cleanup_expired_statuses():
 threading.Thread(target=cleanup_expired_statuses, daemon=True).start()
 
 @api_router.post("/stories/upload")
-async def upload_story_file(file: UploadFile = File(...), user: dict = Depends(require_student_verification)):
+async def upload_story_file(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
     allowed_types = ["image/jpeg", "image/png", "image/webp", "video/mp4", "video/quicktime"]
     if file.content_type not in allowed_types:
         raise HTTPException(400, "Unsupported file type")
@@ -1874,7 +1848,7 @@ async def upload_story_file(file: UploadFile = File(...), user: dict = Depends(r
         return {"url": public_url}
 
 @api_router.post("/stories")
-async def create_story(payload: CreateStatusPayload, user: dict = Depends(require_student_verification)):
+async def create_story(payload: CreateStatusPayload, user: dict = Depends(get_current_user)):
     if not user.get("university_id"):
         raise HTTPException(400, "University not set")
     if payload.type not in ("text", "image", "video"):
@@ -1901,7 +1875,7 @@ async def create_story(payload: CreateStatusPayload, user: dict = Depends(requir
     return {"ok": True, "status_id": status_id}
 
 @api_router.get("/stories/feed")
-def get_story_feed(user: dict = Depends(require_student_verification)):
+def get_story_feed(user: dict = Depends(get_current_user)):
     follows = sb.table("user_follows").select("followed_id").eq("follower_id", user["user_id"]).execute().data or []
     followed_ids = [f["followed_id"] for f in follows]
     if not followed_ids:
@@ -1937,7 +1911,7 @@ def get_user_stories(user_id: str):
     return statuses
 
 @api_router.delete("/stories/{status_id}")
-def delete_story(status_id: str, user: dict = Depends(require_student_verification)):
+def delete_story(status_id: str, user: dict = Depends(get_current_user)):
     story = _maybe(sb.table("statuses").select("*").eq("status_id", status_id).eq("university_id", user["university_id"]).maybe_single().execute())
     if not story:
         raise HTTPException(404, "Story not found")
@@ -1948,7 +1922,7 @@ def delete_story(status_id: str, user: dict = Depends(require_student_verificati
 
 # ---------- Follow / Unfollow ----------
 @api_router.post("/users/follow")
-def toggle_follow(payload: FollowPayload, user: dict = Depends(require_student_verification)):
+def toggle_follow(payload: FollowPayload, user: dict = Depends(get_current_user)):
     if payload.user_id == user["user_id"]:
         raise HTTPException(400, "You cannot follow yourself")
 
@@ -1970,7 +1944,7 @@ def toggle_follow(payload: FollowPayload, user: dict = Depends(require_student_v
         return {"ok": True, "following": True}
 
 @api_router.get("/users/search")
-def search_users(q: str, user: dict = Depends(require_student_verification)):
+def search_users(q: str, user: dict = Depends(get_current_user)):
     if not q or len(q) < 2:
         return []
     profiles = sb.table("user_profiles") \
@@ -2004,7 +1978,7 @@ def search_users(q: str, user: dict = Depends(require_student_verification)):
     return result[:30]
 
 @api_router.get("/users/following")
-def list_following(user: dict = Depends(require_student_verification)):
+def list_following(user: dict = Depends(get_current_user)):
     follows = sb.table("user_follows").select("followed_id").eq("follower_id", user["user_id"]).execute().data or []
     ids = [f["followed_id"] for f in follows]
     if not ids:
@@ -2022,7 +1996,7 @@ def list_following(user: dict = Depends(require_student_verification)):
     return result
 
 @api_router.get("/users/discover")
-def discover_users(limit: int = 20, offset: int = 0, user: dict = Depends(require_student_verification)):
+def discover_users(limit: int = 20, offset: int = 0, user: dict = Depends(get_current_user)):
     followed = sb.table("user_follows").select("followed_id").eq("follower_id", user["user_id"]).execute().data or []
     followed_ids = [f["followed_id"] for f in followed]
     exclude_ids = followed_ids + [user["user_id"]]
@@ -2037,9 +2011,9 @@ def discover_users(limit: int = 20, offset: int = 0, user: dict = Depends(requir
     profiles = query.execute().data or []
     return profiles
 
-# ---------- Notes Guru (university-scoped) ----------
+# ---------- Notes Guru ----------
 @api_router.post("/notes")
-async def create_note(payload: NoteCreatePayload, user: dict = Depends(require_student_verification)):
+async def create_note(payload: NoteCreatePayload, user: dict = Depends(get_current_user)):
     if not user.get("university_id"):
         raise HTTPException(400, "University not set")
     if not payload.title.strip() or not payload.course_name.strip() or not payload.course_code.strip() or not payload.price.strip():
@@ -2072,7 +2046,7 @@ async def create_note(payload: NoteCreatePayload, user: dict = Depends(require_s
     return {"ok": True, "note_id": note_id}
 
 @api_router.get("/notes")
-def list_notes(search: Optional[str] = None, user: dict = Depends(require_student_verification)):
+def list_notes(search: Optional[str] = None, user: dict = Depends(get_current_user)):
     query = sb.table("notes").select("*").eq("university_id", user["university_id"]).order("created_at", desc=True)
     if search:
         query = query.ilike("course_code", f"%{search}%")
@@ -2098,7 +2072,7 @@ def list_notes(search: Optional[str] = None, user: dict = Depends(require_studen
     return notes
 
 @api_router.get("/notes/{note_id}")
-def get_note(note_id: str, user: dict = Depends(require_student_verification)):
+def get_note(note_id: str, user: dict = Depends(get_current_user)):
     note = _maybe(sb.table("notes").select("*").eq("note_id", note_id).eq("university_id", user["university_id"]).maybe_single().execute())
     if not note:
         raise HTTPException(404, "Note not found")
@@ -2110,7 +2084,7 @@ def get_note(note_id: str, user: dict = Depends(require_student_verification)):
     return note
 
 @api_router.put("/notes/{note_id}")
-async def update_note(note_id: str, payload: NoteUpdatePayload, user: dict = Depends(require_student_verification)):
+async def update_note(note_id: str, payload: NoteUpdatePayload, user: dict = Depends(get_current_user)):
     note = _maybe(sb.table("notes").select("*").eq("note_id", note_id).eq("university_id", user["university_id"]).maybe_single().execute())
     if not note:
         raise HTTPException(404, "Note not found")
@@ -2141,7 +2115,7 @@ async def update_note(note_id: str, payload: NoteUpdatePayload, user: dict = Dep
     return {"ok": True}
 
 @api_router.delete("/notes/{note_id}")
-def delete_note(note_id: str, user: dict = Depends(require_student_verification)):
+def delete_note(note_id: str, user: dict = Depends(get_current_user)):
     note = _maybe(sb.table("notes").select("*").eq("note_id", note_id).eq("university_id", user["university_id"]).maybe_single().execute())
     if not note:
         raise HTTPException(404, "Note not found")
@@ -2151,14 +2125,14 @@ def delete_note(note_id: str, user: dict = Depends(require_student_verification)
     return {"ok": True}
 
 @api_router.get("/notes/my-count")
-def my_notes_count(user: dict = Depends(require_student_verification)):
+def my_notes_count(user: dict = Depends(get_current_user)):
     res = sb.table("notes").select("note_id", count="exact").eq("user_id", user["user_id"]).execute()
     count = res.count if hasattr(res, 'count') else 0
     return {"count": count}
 
 # ---------- Note Reviews ----------
 @api_router.post("/notes/{note_id}/reviews")
-def create_note_review(note_id: str, payload: NoteReviewPayload, user: dict = Depends(require_student_verification)):
+def create_note_review(note_id: str, payload: NoteReviewPayload, user: dict = Depends(get_current_user)):
     note = _maybe(sb.table("notes").select("note_id").eq("note_id", note_id).eq("university_id", user["university_id"]).maybe_single().execute())
     if not note:
         raise HTTPException(404, "Note not found")
@@ -2188,7 +2162,7 @@ def create_note_review(note_id: str, payload: NoteReviewPayload, user: dict = De
         return {"ok": True, "review_id": review_id}
 
 @api_router.get("/notes/{note_id}/reviews")
-def list_note_reviews(note_id: str, user: dict = Depends(require_student_verification)):
+def list_note_reviews(note_id: str, user: dict = Depends(get_current_user)):
     reviews = sb.table("note_reviews")\
         .select("review_id, note_id, user_id, rating, comment, created_at, users!inner(name, picture)")\
         .eq("note_id", note_id).order("created_at", desc=True).execute().data or []
@@ -2203,15 +2177,15 @@ def list_note_reviews(note_id: str, user: dict = Depends(require_student_verific
     return enriched
 
 @api_router.get("/notes/{note_id}/my-rating")
-def get_my_note_rating(note_id: str, user: dict = Depends(require_student_verification)):
+def get_my_note_rating(note_id: str, user: dict = Depends(get_current_user)):
     review = _maybe(sb.table("note_reviews")
         .select("rating")
         .eq("note_id", note_id).eq("user_id", user["user_id"]).gt("rating", 0).maybe_single().execute())
     return {"rating": review["rating"] if review else 0}
 
-# ---------- Lost & Found (university-scoped) ----------
+# ---------- Lost & Found ----------
 @api_router.post("/lost-found")
-def create_lost_found_item(payload: LostFoundCreatePayload, user: dict = Depends(require_student_verification)):
+def create_lost_found_item(payload: LostFoundCreatePayload, user: dict = Depends(get_current_user)):
     if not user.get("university_id"):
         raise HTTPException(400, "University not set")
     if not payload.title.strip():
@@ -2236,7 +2210,7 @@ def create_lost_found_item(payload: LostFoundCreatePayload, user: dict = Depends
     return {"ok": True, "item_id": item_id}
 
 @api_router.get("/lost-found")
-def list_lost_found_items(search: Optional[str] = None, user: dict = Depends(require_student_verification)):
+def list_lost_found_items(search: Optional[str] = None, user: dict = Depends(get_current_user)):
     query = sb.table("lost_found_items").select("*").eq("university_id", user["university_id"]).order("created_at", desc=True)
     if search:
         query = query.or_(f"title.ilike.%{search}%,location.ilike.%{search}%")
@@ -2244,14 +2218,14 @@ def list_lost_found_items(search: Optional[str] = None, user: dict = Depends(req
     return items
 
 @api_router.get("/lost-found/{item_id}")
-def get_lost_found_item(item_id: str, user: dict = Depends(require_student_verification)):
+def get_lost_found_item(item_id: str, user: dict = Depends(get_current_user)):
     item = _maybe(sb.table("lost_found_items").select("*").eq("item_id", item_id).eq("university_id", user["university_id"]).maybe_single().execute())
     if not item:
         raise HTTPException(404, "Item not found")
     return item
 
 @api_router.put("/lost-found/{item_id}")
-def update_lost_found_item(item_id: str, payload: LostFoundUpdatePayload, user: dict = Depends(require_student_verification)):
+def update_lost_found_item(item_id: str, payload: LostFoundUpdatePayload, user: dict = Depends(get_current_user)):
     item = _maybe(sb.table("lost_found_items").select("*").eq("item_id", item_id).eq("university_id", user["university_id"]).maybe_single().execute())
     if not item:
         raise HTTPException(404, "Item not found")
@@ -2269,7 +2243,7 @@ def update_lost_found_item(item_id: str, payload: LostFoundUpdatePayload, user: 
     return {"ok": True}
 
 @api_router.delete("/lost-found/{item_id}")
-def delete_lost_found_item(item_id: str, user: dict = Depends(require_student_verification)):
+def delete_lost_found_item(item_id: str, user: dict = Depends(get_current_user)):
     item = _maybe(sb.table("lost_found_items").select("*").eq("item_id", item_id).eq("university_id", user["university_id"]).maybe_single().execute())
     if not item:
         raise HTTPException(404, "Item not found")
@@ -2278,9 +2252,9 @@ def delete_lost_found_item(item_id: str, user: dict = Depends(require_student_ve
     sb.table("lost_found_items").delete().eq("item_id", item_id).execute()
     return {"ok": True}
 
-# ---------- Campus Directions (university-scoped) ----------
+# ---------- Campus Directions ----------
 @api_router.post("/directions")
-def create_direction(payload: DirectionCreatePayload, user: dict = Depends(require_student_verification)):
+def create_direction(payload: DirectionCreatePayload, user: dict = Depends(get_current_user)):
     if not user.get("university_id"):
         raise HTTPException(400, "University not set")
     if not payload.from_location.strip() or not payload.to_location.strip():
@@ -2305,7 +2279,7 @@ def create_direction(payload: DirectionCreatePayload, user: dict = Depends(requi
     return {"ok": True, "route_id": route_id}
 
 @api_router.get("/directions")
-def list_directions(search: Optional[str] = None, user: dict = Depends(require_student_verification)):
+def list_directions(search: Optional[str] = None, user: dict = Depends(get_current_user)):
     query = sb.table("directions").select("*").eq("university_id", user["university_id"]).order("created_at", desc=True)
     if search:
         query = query.or_(f"from_location.ilike.%{search}%,to_location.ilike.%{search}%")
@@ -2313,14 +2287,14 @@ def list_directions(search: Optional[str] = None, user: dict = Depends(require_s
     return routes
 
 @api_router.get("/directions/{route_id}")
-def get_direction(route_id: str, user: dict = Depends(require_student_verification)):
+def get_direction(route_id: str, user: dict = Depends(get_current_user)):
     route = _maybe(sb.table("directions").select("*").eq("route_id", route_id).eq("university_id", user["university_id"]).maybe_single().execute())
     if not route:
         raise HTTPException(404, "Route not found")
     return route
 
 @api_router.put("/directions/{route_id}")
-def update_direction(route_id: str, payload: DirectionUpdatePayload, user: dict = Depends(require_student_verification)):
+def update_direction(route_id: str, payload: DirectionUpdatePayload, user: dict = Depends(get_current_user)):
     route = _maybe(sb.table("directions").select("*").eq("route_id", route_id).eq("university_id", user["university_id"]).maybe_single().execute())
     if not route:
         raise HTTPException(404, "Route not found")
@@ -2338,7 +2312,7 @@ def update_direction(route_id: str, payload: DirectionUpdatePayload, user: dict 
     return {"ok": True}
 
 @api_router.delete("/directions/{route_id}")
-def delete_direction(route_id: str, user: dict = Depends(require_student_verification)):
+def delete_direction(route_id: str, user: dict = Depends(get_current_user)):
     route = _maybe(sb.table("directions").select("*").eq("route_id", route_id).eq("university_id", user["university_id"]).maybe_single().execute())
     if not route:
         raise HTTPException(404, "Route not found")
@@ -2347,9 +2321,9 @@ def delete_direction(route_id: str, user: dict = Depends(require_student_verific
     sb.table("directions").delete().eq("route_id", route_id).execute()
     return {"ok": True}
 
-# ---------- Announcements (university-scoped) ----------
+# ---------- Announcements ----------
 @api_router.post("/announcements")
-def create_announcement(payload: AnnouncementCreatePayload, user: dict = Depends(require_student_verification)):
+def create_announcement(payload: AnnouncementCreatePayload, user: dict = Depends(get_current_user)):
     if not user.get("university_id"):
         raise HTTPException(400, "University not set")
     if not payload.title.strip():
@@ -2379,7 +2353,7 @@ def create_announcement(payload: AnnouncementCreatePayload, user: dict = Depends
     return {"ok": True, "announcement_id": announcement_id}
 
 @api_router.get("/announcements")
-def list_announcements(search: Optional[str] = None, status: Optional[str] = None, user: dict = Depends(require_student_verification)):
+def list_announcements(search: Optional[str] = None, status: Optional[str] = None, user: dict = Depends(get_current_user)):
     query = sb.table("announcements").select("*").eq("university_id", user["university_id"]).order("created_at", desc=True)
     if status and status.lower() != "all":
         query = query.eq("status", status.lower())
@@ -2389,14 +2363,14 @@ def list_announcements(search: Optional[str] = None, status: Optional[str] = Non
     return items
 
 @api_router.get("/announcements/{announcement_id}")
-def get_announcement(announcement_id: str, user: dict = Depends(require_student_verification)):
+def get_announcement(announcement_id: str, user: dict = Depends(get_current_user)):
     announcement = _maybe(sb.table("announcements").select("*").eq("announcement_id", announcement_id).eq("university_id", user["university_id"]).maybe_single().execute())
     if not announcement:
         raise HTTPException(404, "Announcement not found")
     return announcement
 
 @api_router.put("/announcements/{announcement_id}")
-def update_announcement(announcement_id: str, payload: AnnouncementUpdatePayload, user: dict = Depends(require_student_verification)):
+def update_announcement(announcement_id: str, payload: AnnouncementUpdatePayload, user: dict = Depends(get_current_user)):
     announcement = _maybe(sb.table("announcements").select("*").eq("announcement_id", announcement_id).eq("university_id", user["university_id"]).maybe_single().execute())
     if not announcement:
         raise HTTPException(404, "Announcement not found")
@@ -2420,7 +2394,7 @@ def update_announcement(announcement_id: str, payload: AnnouncementUpdatePayload
     return {"ok": True}
 
 @api_router.delete("/announcements/{announcement_id}")
-def delete_announcement(announcement_id: str, user: dict = Depends(require_student_verification)):
+def delete_announcement(announcement_id: str, user: dict = Depends(get_current_user)):
     announcement = _maybe(sb.table("announcements").select("*").eq("announcement_id", announcement_id).eq("university_id", user["university_id"]).maybe_single().execute())
     if not announcement:
         raise HTTPException(404, "Announcement not found")
@@ -2429,9 +2403,9 @@ def delete_announcement(announcement_id: str, user: dict = Depends(require_stude
     sb.table("announcements").delete().eq("announcement_id", announcement_id).execute()
     return {"ok": True}
 
-# ---------- Events (university-scoped) ----------
+# ---------- Events ----------
 @api_router.post("/events")
-async def create_event(payload: EventCreatePayload, user: dict = Depends(require_student_verification)):
+async def create_event(payload: EventCreatePayload, user: dict = Depends(get_current_user)):
     if not user.get("university_id"):
         raise HTTPException(400, "University not set")
     if not payload.title.strip():
@@ -2465,7 +2439,7 @@ async def create_event(payload: EventCreatePayload, user: dict = Depends(require
     return {"ok": True, "event_id": event_id}
 
 @api_router.get("/events")
-def list_events(search: Optional[str] = None, category: Optional[str] = None, user: dict = Depends(require_student_verification)):
+def list_events(search: Optional[str] = None, category: Optional[str] = None, user: dict = Depends(get_current_user)):
     query = sb.table("events").select("*").eq("university_id", user["university_id"]).order("created_at", desc=True)
     if category and category.lower() != "all":
         query = query.eq("category", category.lower())
@@ -2475,14 +2449,14 @@ def list_events(search: Optional[str] = None, category: Optional[str] = None, us
     return events
 
 @api_router.get("/events/{event_id}")
-def get_event(event_id: str, user: dict = Depends(require_student_verification)):
+def get_event(event_id: str, user: dict = Depends(get_current_user)):
     event = _maybe(sb.table("events").select("*").eq("event_id", event_id).eq("university_id", user["university_id"]).maybe_single().execute())
     if not event:
         raise HTTPException(404, "Event not found")
     return event
 
 @api_router.put("/events/{event_id}")
-async def update_event(event_id: str, payload: EventUpdatePayload, user: dict = Depends(require_student_verification)):
+async def update_event(event_id: str, payload: EventUpdatePayload, user: dict = Depends(get_current_user)):
     event = _maybe(sb.table("events").select("*").eq("event_id", event_id).eq("university_id", user["university_id"]).maybe_single().execute())
     if not event:
         raise HTTPException(404, "Event not found")
@@ -2509,7 +2483,7 @@ async def update_event(event_id: str, payload: EventUpdatePayload, user: dict = 
     return {"ok": True}
 
 @api_router.delete("/events/{event_id}")
-def delete_event(event_id: str, user: dict = Depends(require_student_verification)):
+def delete_event(event_id: str, user: dict = Depends(get_current_user)):
     event = _maybe(sb.table("events").select("*").eq("event_id", event_id).eq("university_id", user["university_id"]).maybe_single().execute())
     if not event:
         raise HTTPException(404, "Event not found")
