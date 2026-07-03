@@ -390,6 +390,12 @@ class EventUpdatePayload(BaseModel):
     venue: Optional[str] = None
     images: Optional[List[str]] = None
 
+# ---------- NEW: Quiz submission model ----------
+class QuizSubmitPayload(BaseModel):
+    title: str
+    category: str = "General"
+    questions: List[dict]   # list of {question, options, correctAnswerIndex, explanation}
+
 # ---------- Auth ----------
 async def get_current_user(
     request: Request,
@@ -740,6 +746,8 @@ def admin_stats(university_id: Optional[str] = None, user: dict = Depends(requir
         "approved_bursaries": count("bursaries", "approved", university_id),
         "total_announcements": count("announcements", uni_id=university_id),
         "total_events": count("events", uni_id=university_id),
+        "total_quizzes": count("quizzes", uni_id=university_id),
+        "pending_quizzes": count("quizzes", "pending", university_id),
     }
 
 @api_router.get("/admin/pending-tutors")
@@ -756,6 +764,84 @@ def admin_pending_bursaries(university_id: Optional[str] = None, user: dict = De
         q = q.eq("university_id", university_id)
     return q.execute().data or []
 
+# ---------- NEW: Admin Quiz management ----------
+@api_router.get("/admin/pending-quizzes")
+def admin_pending_quizzes(university_id: Optional[str] = None, user: dict = Depends(require_admin)):
+    q = sb.table("quizzes").select("*").eq("status", "pending").order("created_at", desc=True)
+    if university_id:
+        q = q.eq("university_id", university_id)
+    return q.execute().data or []
+
+@api_router.put("/admin/quizzes/{quiz_id}/approve")
+def admin_approve_quiz(quiz_id: str, user: dict = Depends(require_admin)):
+    quiz = _maybe(sb.table("quizzes").select("*").eq("quiz_id", quiz_id).maybe_single().execute())
+    if not quiz:
+        raise HTTPException(404, "Quiz not found")
+    sb.table("quizzes").update({"status": "approved"}).eq("quiz_id", quiz_id).execute()
+    return {"ok": True}
+
+@api_router.put("/admin/quizzes/{quiz_id}/reject")
+def admin_reject_quiz(quiz_id: str, user: dict = Depends(require_admin)):
+    quiz = _maybe(sb.table("quizzes").select("*").eq("quiz_id", quiz_id).maybe_single().execute())
+    if not quiz:
+        raise HTTPException(404, "Quiz not found")
+    sb.table("quizzes").update({"status": "rejected", "rejection_reason": None}).eq("quiz_id", quiz_id).execute()
+    return {"ok": True}
+
+# ---------- Quiz submission (student) ----------
+@api_router.post("/quizzes")
+def submit_quiz(payload: QuizSubmitPayload, user: dict = Depends(get_current_user)):
+    if not user.get("university_id"):
+        raise HTTPException(400, "University not set")
+    if not payload.title.strip():
+        raise HTTPException(400, "Title is required")
+    if not payload.questions or len(payload.questions) == 0:
+        raise HTTPException(400, "At least one question is required")
+    # basic validation of each question
+    for i, q in enumerate(payload.questions):
+        if not q.get("question", "").strip():
+            raise HTTPException(400, f"Question {i+1} has no text")
+        if not isinstance(q.get("options"), list) or len(q["options"]) < 2:
+            raise HTTPException(400, f"Question {i+1} must have at least 2 options")
+        if q.get("correctAnswerIndex") is None or not isinstance(q["correctAnswerIndex"], int):
+            raise HTTPException(400, f"Question {i+1} missing correct answer index")
+        if not q.get("explanation", "").strip():
+            raise HTTPException(400, f"Question {i+1} needs an explanation")
+
+    quiz_id = f"qz_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+    sb.table("quizzes").insert({
+        "quiz_id": quiz_id,
+        "user_id": user["user_id"],
+        "university_id": user["university_id"],
+        "title": payload.title.strip(),
+        "category": payload.category.strip(),
+        "questions": json.dumps(payload.questions),  # store as JSON string
+        "status": "pending",
+        "created_at": now,
+        "updated_at": now
+    }).execute()
+    return {"ok": True, "quiz_id": quiz_id}
+
+# ---------- Get approved quizzes (for students to play) ----------
+@api_router.get("/quizzes")
+def list_approved_quizzes(category: Optional[str] = None, search: Optional[str] = None, user: dict = Depends(get_current_user)):
+    query = sb.table("quizzes").select("*").eq("university_id", user["university_id"]).eq("status", "approved").order("created_at", desc=True)
+    if category:
+        query = query.eq("category", category)
+    if search:
+        query = query.ilike("title", f"%{search}%")
+    quizzes = query.execute().data or []
+    # parse questions from JSON string to list for frontend
+    for q in quizzes:
+        if isinstance(q.get("questions"), str):
+            try:
+                q["questions"] = json.loads(q["questions"])
+            except:
+                q["questions"] = []
+    return quizzes
+
+# ---------- Existing admin approve/reject for tutors and bursaries (unchanged) ----------
 @api_router.put("/admin/tutors/{tutor_id}/approve")
 def admin_approve_tutor(tutor_id: str, user: dict = Depends(require_admin)):
     tutor = _maybe(sb.table("tutors").select("*").eq("tutor_id", tutor_id).maybe_single().execute())
