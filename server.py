@@ -360,6 +360,7 @@ class AnnouncementCreatePayload(BaseModel):
     status: str = "active"
     priority: str = "medium"
     expires_in: Optional[int] = None
+    university_id: Optional[str] = None   # for admins to set university
 
 class AnnouncementUpdatePayload(BaseModel):
     title: Optional[str] = None
@@ -379,6 +380,7 @@ class EventCreatePayload(BaseModel):
     time: str = ""
     venue: str = ""
     images: Optional[List[str]] = []
+    university_id: Optional[str] = None   # for admins to set university
 
 class EventUpdatePayload(BaseModel):
     title: Optional[str] = None
@@ -2487,7 +2489,12 @@ def delete_direction(route_id: str, user: dict = Depends(get_current_user)):
 # ---------- Announcements ----------
 @api_router.post("/announcements")
 def create_announcement(payload: AnnouncementCreatePayload, user: dict = Depends(get_current_user)):
-    if not user.get("university_id"):
+    # Admins can set university_id manually; otherwise use the user's own university
+    if user.get("is_admin") and payload.university_id:
+        university_id = payload.university_id
+    else:
+        university_id = user.get("university_id")
+    if not university_id:
         raise HTTPException(400, "University not set")
     if not payload.title.strip():
         raise HTTPException(400, "Title is required")
@@ -2502,7 +2509,7 @@ def create_announcement(payload: AnnouncementCreatePayload, user: dict = Depends
     sb.table("announcements").insert({
         "announcement_id": announcement_id,
         "user_id": user["user_id"],
-        "university_id": user["university_id"],
+        "university_id": university_id,
         "title": payload.title.strip(),
         "category": payload.category.strip() or "Notice",
         "department": payload.department.strip(),
@@ -2569,7 +2576,12 @@ def delete_announcement(announcement_id: str, user: dict = Depends(get_current_u
 # ---------- Events ----------
 @api_router.post("/events")
 async def create_event(payload: EventCreatePayload, user: dict = Depends(get_current_user)):
-    if not user.get("university_id"):
+    # Admins can set university_id manually; otherwise use the user's own university
+    if user.get("is_admin") and payload.university_id:
+        university_id = payload.university_id
+    else:
+        university_id = user.get("university_id")
+    if not university_id:
         raise HTTPException(400, "University not set")
     if not payload.title.strip():
         raise HTTPException(400, "Title is required")
@@ -2587,7 +2599,7 @@ async def create_event(payload: EventCreatePayload, user: dict = Depends(get_cur
     sb.table("events").insert({
         "event_id": event_id,
         "user_id": user["user_id"],
-        "university_id": user["university_id"],
+        "university_id": university_id,
         "title": payload.title.strip(),
         "category": payload.category.strip() or "Other",
         "department": payload.department.strip(),
