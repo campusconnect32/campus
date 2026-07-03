@@ -360,7 +360,7 @@ class AnnouncementCreatePayload(BaseModel):
     status: str = "active"
     priority: str = "medium"
     expires_in: Optional[int] = None
-    university_id: Optional[str] = None   # for admins to set university
+    university_id: Optional[str] = None
 
 class AnnouncementUpdatePayload(BaseModel):
     title: Optional[str] = None
@@ -380,7 +380,7 @@ class EventCreatePayload(BaseModel):
     time: str = ""
     venue: str = ""
     images: Optional[List[str]] = []
-    university_id: Optional[str] = None   # for admins to set university
+    university_id: Optional[str] = None
 
 class EventUpdatePayload(BaseModel):
     title: Optional[str] = None
@@ -392,11 +392,10 @@ class EventUpdatePayload(BaseModel):
     venue: Optional[str] = None
     images: Optional[List[str]] = None
 
-# ---------- NEW: Quiz submission model ----------
 class QuizSubmitPayload(BaseModel):
     title: str
     category: str = "General"
-    questions: List[dict]   # list of {question, options, correctAnswerIndex, explanation}
+    questions: List[dict]
 
 # ---------- Auth ----------
 async def get_current_user(
@@ -427,6 +426,14 @@ async def require_admin(user: dict = Depends(get_current_user)):
     if not user.get("is_admin"):
         raise HTTPException(403, "Admin access required")
     return user
+
+# ---------- Helper for mirrored university view ----------
+def get_effective_university_id(user: dict, requested_uni_id: Optional[str] = None) -> Optional[str]:
+    """If user is admin and a university_id is explicitly provided, use it.
+       Otherwise fall back to the user's own university_id."""
+    if user.get("is_admin") and requested_uni_id:
+        return requested_uni_id
+    return user.get("university_id")
 
 # ---------- Root ----------
 @app.get("/")
@@ -766,7 +773,6 @@ def admin_pending_bursaries(university_id: Optional[str] = None, user: dict = De
         q = q.eq("university_id", university_id)
     return q.execute().data or []
 
-# ---------- NEW: Admin Quiz management ----------
 @api_router.get("/admin/pending-quizzes")
 def admin_pending_quizzes(university_id: Optional[str] = None, user: dict = Depends(require_admin)):
     q = sb.table("quizzes").select("*").eq("status", "pending").order("created_at", desc=True)
@@ -790,60 +796,6 @@ def admin_reject_quiz(quiz_id: str, user: dict = Depends(require_admin)):
     sb.table("quizzes").update({"status": "rejected", "rejection_reason": None}).eq("quiz_id", quiz_id).execute()
     return {"ok": True}
 
-# ---------- Quiz submission (student) ----------
-@api_router.post("/quizzes")
-def submit_quiz(payload: QuizSubmitPayload, user: dict = Depends(get_current_user)):
-    if not user.get("university_id"):
-        raise HTTPException(400, "University not set")
-    if not payload.title.strip():
-        raise HTTPException(400, "Title is required")
-    if not payload.questions or len(payload.questions) == 0:
-        raise HTTPException(400, "At least one question is required")
-    # basic validation of each question
-    for i, q in enumerate(payload.questions):
-        if not q.get("question", "").strip():
-            raise HTTPException(400, f"Question {i+1} has no text")
-        if not isinstance(q.get("options"), list) or len(q["options"]) < 2:
-            raise HTTPException(400, f"Question {i+1} must have at least 2 options")
-        if q.get("correctAnswerIndex") is None or not isinstance(q["correctAnswerIndex"], int):
-            raise HTTPException(400, f"Question {i+1} missing correct answer index")
-        if not q.get("explanation", "").strip():
-            raise HTTPException(400, f"Question {i+1} needs an explanation")
-
-    quiz_id = f"qz_{uuid.uuid4().hex[:12]}"
-    now = datetime.now(timezone.utc).isoformat()
-    sb.table("quizzes").insert({
-        "quiz_id": quiz_id,
-        "user_id": user["user_id"],
-        "university_id": user["university_id"],
-        "title": payload.title.strip(),
-        "category": payload.category.strip(),
-        "questions": json.dumps(payload.questions),  # store as JSON string
-        "status": "pending",
-        "created_at": now,
-        "updated_at": now
-    }).execute()
-    return {"ok": True, "quiz_id": quiz_id}
-
-# ---------- Get approved quizzes (for students to play) ----------
-@api_router.get("/quizzes")
-def list_approved_quizzes(category: Optional[str] = None, search: Optional[str] = None, user: dict = Depends(get_current_user)):
-    query = sb.table("quizzes").select("*").eq("university_id", user["university_id"]).eq("status", "approved").order("created_at", desc=True)
-    if category:
-        query = query.eq("category", category)
-    if search:
-        query = query.ilike("title", f"%{search}%")
-    quizzes = query.execute().data or []
-    # parse questions from JSON string to list for frontend
-    for q in quizzes:
-        if isinstance(q.get("questions"), str):
-            try:
-                q["questions"] = json.loads(q["questions"])
-            except:
-                q["questions"] = []
-    return quizzes
-
-# ---------- Existing admin approve/reject for tutors and bursaries (unchanged) ----------
 @api_router.put("/admin/tutors/{tutor_id}/approve")
 def admin_approve_tutor(tutor_id: str, user: dict = Depends(require_admin)):
     tutor = _maybe(sb.table("tutors").select("*").eq("tutor_id", tutor_id).maybe_single().execute())
@@ -875,6 +827,57 @@ def admin_reject_bursary(bursary_id: str, user: dict = Depends(require_admin)):
         raise HTTPException(404, "Bursary not found")
     sb.table("bursaries").update({"status": "rejected", "rejection_reason": None}).eq("bursary_id", bursary_id).execute()
     return {"ok": True}
+
+# ---------- Quiz submission (student) ----------
+@api_router.post("/quizzes")
+def submit_quiz(payload: QuizSubmitPayload, user: dict = Depends(get_current_user)):
+    if not user.get("university_id"):
+        raise HTTPException(400, "University not set")
+    if not payload.title.strip():
+        raise HTTPException(400, "Title is required")
+    if not payload.questions or len(payload.questions) == 0:
+        raise HTTPException(400, "At least one question is required")
+    for i, q in enumerate(payload.questions):
+        if not q.get("question", "").strip():
+            raise HTTPException(400, f"Question {i+1} has no text")
+        if not isinstance(q.get("options"), list) or len(q["options"]) < 2:
+            raise HTTPException(400, f"Question {i+1} must have at least 2 options")
+        if q.get("correctAnswerIndex") is None or not isinstance(q["correctAnswerIndex"], int):
+            raise HTTPException(400, f"Question {i+1} missing correct answer index")
+        if not q.get("explanation", "").strip():
+            raise HTTPException(400, f"Question {i+1} needs an explanation")
+
+    quiz_id = f"qz_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+    sb.table("quizzes").insert({
+        "quiz_id": quiz_id,
+        "user_id": user["user_id"],
+        "university_id": user["university_id"],
+        "title": payload.title.strip(),
+        "category": payload.category.strip(),
+        "questions": json.dumps(payload.questions),
+        "status": "pending",
+        "created_at": now,
+        "updated_at": now
+    }).execute()
+    return {"ok": True, "quiz_id": quiz_id}
+
+@api_router.get("/quizzes")
+def list_approved_quizzes(category: Optional[str] = None, search: Optional[str] = None, university_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    effective_uni = get_effective_university_id(user, university_id)
+    query = sb.table("quizzes").select("*").eq("university_id", effective_uni).eq("status", "approved").order("created_at", desc=True)
+    if category:
+        query = query.eq("category", category)
+    if search:
+        query = query.ilike("title", f"%{search}%")
+    quizzes = query.execute().data or []
+    for q in quizzes:
+        if isinstance(q.get("questions"), str):
+            try:
+                q["questions"] = json.loads(q["questions"])
+            except:
+                q["questions"] = []
+    return quizzes
 
 # ---------- Location ----------
 @api_router.post("/location/update")
@@ -1109,8 +1112,9 @@ async def create_tutor(payload: TutorCreatePayload, user: dict = Depends(get_cur
     return {"ok": True, "tutor_id": tutor_id}
 
 @api_router.get("/tutors")
-def list_tutors(search: Optional[str] = None, user: dict = Depends(get_current_user)):
-    query = sb.table("tutors").select("*").eq("university_id", user["university_id"]).order("created_at", desc=True)
+def list_tutors(search: Optional[str] = None, university_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    effective_uni = get_effective_university_id(user, university_id)
+    query = sb.table("tutors").select("*").eq("university_id", effective_uni).order("created_at", desc=True)
     if search:
         query = query.ilike("course_code", f"%{search}%")
     tutors = query.execute().data or []
@@ -1137,8 +1141,9 @@ def list_tutors(search: Optional[str] = None, user: dict = Depends(get_current_u
     return tutors
 
 @api_router.get("/tutors/{tutor_id}")
-def get_tutor(tutor_id: str, user: dict = Depends(get_current_user)):
-    tutor = _maybe(sb.table("tutors").select("*").eq("tutor_id", tutor_id).eq("university_id", user["university_id"]).maybe_single().execute())
+def get_tutor(tutor_id: str, university_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    effective_uni = get_effective_university_id(user, university_id)
+    tutor = _maybe(sb.table("tutors").select("*").eq("tutor_id", tutor_id).eq("university_id", effective_uni).maybe_single().execute())
     if not tutor:
         raise HTTPException(404, "Tutor not found")
     rating_data = sb.table("tutor_reviews") \
@@ -1236,7 +1241,8 @@ def create_tutor_review(tutor_id: str, payload: TutorReviewPayload, user: dict =
         return {"ok": True, "review_id": review_id}
 
 @api_router.get("/tutors/{tutor_id}/reviews")
-def list_tutor_reviews(tutor_id: str, user: dict = Depends(get_current_user)):
+def list_tutor_reviews(tutor_id: str, university_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    effective_uni = get_effective_university_id(user, university_id)
     reviews = sb.table("tutor_reviews")\
         .select("review_id, tutor_id, user_id, rating, comment, created_at, users!fk_review_user(name, picture)")\
         .eq("tutor_id", tutor_id)\
@@ -1336,8 +1342,9 @@ async def create_market_item(payload: MarketItemCreatePayload, user: dict = Depe
     return {"ok": True, "item_id": item_id}
 
 @api_router.get("/marketplace/items")
-def list_market_items(category: Optional[str] = None, search: Optional[str] = None, user: dict = Depends(get_current_user)):
-    query = sb.table("marketplace_items").select("*").eq("university_id", user["university_id"]).order("created_at", desc=True)
+def list_market_items(category: Optional[str] = None, search: Optional[str] = None, university_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    effective_uni = get_effective_university_id(user, university_id)
+    query = sb.table("marketplace_items").select("*").eq("university_id", effective_uni).order("created_at", desc=True)
     if category:
         query = query.eq("category", category)
     if search:
@@ -1363,8 +1370,9 @@ def list_market_items(category: Optional[str] = None, search: Optional[str] = No
     return items
 
 @api_router.get("/marketplace/items/{item_id}")
-def get_market_item(item_id: str, user: dict = Depends(get_current_user)):
-    item = _maybe(sb.table("marketplace_items").select("*").eq("item_id", item_id).eq("university_id", user["university_id"]).maybe_single().execute())
+def get_market_item(item_id: str, university_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    effective_uni = get_effective_university_id(user, university_id)
+    item = _maybe(sb.table("marketplace_items").select("*").eq("item_id", item_id).eq("university_id", effective_uni).maybe_single().execute())
     if not item:
         raise HTTPException(404, "Item not found")
     return item
@@ -1586,16 +1594,18 @@ async def create_club(payload: ClubCreatePayload, user: dict = Depends(get_curre
     return {"ok": True, "club_id": club_id}
 
 @api_router.get("/clubs")
-def list_clubs(user: dict = Depends(get_current_user)):
-    clubs = sb.table("clubs").select("*").eq("university_id", user["university_id"]).order("created_at", desc=True).execute().data or []
+def list_clubs(university_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    effective_uni = get_effective_university_id(user, university_id)
+    clubs = sb.table("clubs").select("*").eq("university_id", effective_uni).order("created_at", desc=True).execute().data or []
     for club in clubs:
         cnt_res = sb.table("club_members").select("member_id", count="exact").eq("club_id", club["club_id"]).eq("status", "approved").execute()
         club["member_count"] = cnt_res.count if hasattr(cnt_res, 'count') else 0
     return clubs
 
 @api_router.get("/clubs/{club_id}")
-def get_club(club_id: str, user: dict = Depends(get_current_user)):
-    club = _maybe(sb.table("clubs").select("*").eq("club_id", club_id).eq("university_id", user["university_id"]).maybe_single().execute())
+def get_club(club_id: str, university_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    effective_uni = get_effective_university_id(user, university_id)
+    club = _maybe(sb.table("clubs").select("*").eq("club_id", club_id).eq("university_id", effective_uni).maybe_single().execute())
     if not club:
         raise HTTPException(404, "Club not found")
     cnt_res = sb.table("club_members").select("member_id", count="exact").eq("club_id", club_id).eq("status", "approved").execute()
@@ -1849,8 +1859,9 @@ async def create_bursary(payload: BursaryCreatePayload, user: dict = Depends(get
     return {"ok": True, "bursary_id": bursary_id}
 
 @api_router.get("/bursaries")
-def list_bursaries(faculty: Optional[str] = None, search: Optional[str] = None, user: dict = Depends(get_current_user)):
-    query = sb.table("bursaries").select("*").eq("university_id", user["university_id"]).order("created_at", desc=True)
+def list_bursaries(faculty: Optional[str] = None, search: Optional[str] = None, university_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    effective_uni = get_effective_university_id(user, university_id)
+    query = sb.table("bursaries").select("*").eq("university_id", effective_uni).order("created_at", desc=True)
 
     if faculty and faculty != "All":
         query = query.contains("faculties", [faculty])
@@ -1877,8 +1888,9 @@ def list_bursaries(faculty: Optional[str] = None, search: Optional[str] = None, 
     return bursaries
 
 @api_router.get("/bursaries/{bursary_id}")
-def get_bursary(bursary_id: str, user: dict = Depends(get_current_user)):
-    bursary = _maybe(sb.table("bursaries").select("*").eq("bursary_id", bursary_id).eq("university_id", user["university_id"]).maybe_single().execute())
+def get_bursary(bursary_id: str, university_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    effective_uni = get_effective_university_id(user, university_id)
+    bursary = _maybe(sb.table("bursaries").select("*").eq("bursary_id", bursary_id).eq("university_id", effective_uni).maybe_single().execute())
     if not bursary:
         raise HTTPException(404, "Bursary not found")
     return bursary
@@ -2211,8 +2223,9 @@ async def create_note(payload: NoteCreatePayload, user: dict = Depends(get_curre
     return {"ok": True, "note_id": note_id}
 
 @api_router.get("/notes")
-def list_notes(search: Optional[str] = None, user: dict = Depends(get_current_user)):
-    query = sb.table("notes").select("*").eq("university_id", user["university_id"]).order("created_at", desc=True)
+def list_notes(search: Optional[str] = None, university_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    effective_uni = get_effective_university_id(user, university_id)
+    query = sb.table("notes").select("*").eq("university_id", effective_uni).order("created_at", desc=True)
     if search:
         query = query.ilike("course_code", f"%{search}%")
     notes = query.execute().data or []
@@ -2237,8 +2250,9 @@ def list_notes(search: Optional[str] = None, user: dict = Depends(get_current_us
     return notes
 
 @api_router.get("/notes/{note_id}")
-def get_note(note_id: str, user: dict = Depends(get_current_user)):
-    note = _maybe(sb.table("notes").select("*").eq("note_id", note_id).eq("university_id", user["university_id"]).maybe_single().execute())
+def get_note(note_id: str, university_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    effective_uni = get_effective_university_id(user, university_id)
+    note = _maybe(sb.table("notes").select("*").eq("note_id", note_id).eq("university_id", effective_uni).maybe_single().execute())
     if not note:
         raise HTTPException(404, "Note not found")
     rating_data = sb.table("note_reviews").select("rating").eq("note_id", note_id).execute().data or []
@@ -2375,16 +2389,18 @@ def create_lost_found_item(payload: LostFoundCreatePayload, user: dict = Depends
     return {"ok": True, "item_id": item_id}
 
 @api_router.get("/lost-found")
-def list_lost_found_items(search: Optional[str] = None, user: dict = Depends(get_current_user)):
-    query = sb.table("lost_found_items").select("*").eq("university_id", user["university_id"]).order("created_at", desc=True)
+def list_lost_found_items(search: Optional[str] = None, university_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    effective_uni = get_effective_university_id(user, university_id)
+    query = sb.table("lost_found_items").select("*").eq("university_id", effective_uni).order("created_at", desc=True)
     if search:
         query = query.or_(f"title.ilike.%{search}%,location.ilike.%{search}%")
     items = query.execute().data or []
     return items
 
 @api_router.get("/lost-found/{item_id}")
-def get_lost_found_item(item_id: str, user: dict = Depends(get_current_user)):
-    item = _maybe(sb.table("lost_found_items").select("*").eq("item_id", item_id).eq("university_id", user["university_id"]).maybe_single().execute())
+def get_lost_found_item(item_id: str, university_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    effective_uni = get_effective_university_id(user, university_id)
+    item = _maybe(sb.table("lost_found_items").select("*").eq("item_id", item_id).eq("university_id", effective_uni).maybe_single().execute())
     if not item:
         raise HTTPException(404, "Item not found")
     return item
@@ -2444,16 +2460,18 @@ def create_direction(payload: DirectionCreatePayload, user: dict = Depends(get_c
     return {"ok": True, "route_id": route_id}
 
 @api_router.get("/directions")
-def list_directions(search: Optional[str] = None, user: dict = Depends(get_current_user)):
-    query = sb.table("directions").select("*").eq("university_id", user["university_id"]).order("created_at", desc=True)
+def list_directions(search: Optional[str] = None, university_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    effective_uni = get_effective_university_id(user, university_id)
+    query = sb.table("directions").select("*").eq("university_id", effective_uni).order("created_at", desc=True)
     if search:
         query = query.or_(f"from_location.ilike.%{search}%,to_location.ilike.%{search}%")
     routes = query.execute().data or []
     return routes
 
 @api_router.get("/directions/{route_id}")
-def get_direction(route_id: str, user: dict = Depends(get_current_user)):
-    route = _maybe(sb.table("directions").select("*").eq("route_id", route_id).eq("university_id", user["university_id"]).maybe_single().execute())
+def get_direction(route_id: str, university_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    effective_uni = get_effective_university_id(user, university_id)
+    route = _maybe(sb.table("directions").select("*").eq("route_id", route_id).eq("university_id", effective_uni).maybe_single().execute())
     if not route:
         raise HTTPException(404, "Route not found")
     return route
@@ -2489,7 +2507,6 @@ def delete_direction(route_id: str, user: dict = Depends(get_current_user)):
 # ---------- Announcements ----------
 @api_router.post("/announcements")
 def create_announcement(payload: AnnouncementCreatePayload, user: dict = Depends(get_current_user)):
-    # Admins can set university_id manually; otherwise use the user's own university
     if user.get("is_admin") and payload.university_id:
         university_id = payload.university_id
     else:
@@ -2523,8 +2540,9 @@ def create_announcement(payload: AnnouncementCreatePayload, user: dict = Depends
     return {"ok": True, "announcement_id": announcement_id}
 
 @api_router.get("/announcements")
-def list_announcements(search: Optional[str] = None, status: Optional[str] = None, user: dict = Depends(get_current_user)):
-    query = sb.table("announcements").select("*").eq("university_id", user["university_id"]).order("created_at", desc=True)
+def list_announcements(search: Optional[str] = None, status: Optional[str] = None, university_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    effective_uni = get_effective_university_id(user, university_id)
+    query = sb.table("announcements").select("*").eq("university_id", effective_uni).order("created_at", desc=True)
     if status and status.lower() != "all":
         query = query.eq("status", status.lower())
     if search:
@@ -2533,8 +2551,9 @@ def list_announcements(search: Optional[str] = None, status: Optional[str] = Non
     return items
 
 @api_router.get("/announcements/{announcement_id}")
-def get_announcement(announcement_id: str, user: dict = Depends(get_current_user)):
-    announcement = _maybe(sb.table("announcements").select("*").eq("announcement_id", announcement_id).eq("university_id", user["university_id"]).maybe_single().execute())
+def get_announcement(announcement_id: str, university_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    effective_uni = get_effective_university_id(user, university_id)
+    announcement = _maybe(sb.table("announcements").select("*").eq("announcement_id", announcement_id).eq("university_id", effective_uni).maybe_single().execute())
     if not announcement:
         raise HTTPException(404, "Announcement not found")
     return announcement
@@ -2576,7 +2595,6 @@ def delete_announcement(announcement_id: str, user: dict = Depends(get_current_u
 # ---------- Events ----------
 @api_router.post("/events")
 async def create_event(payload: EventCreatePayload, user: dict = Depends(get_current_user)):
-    # Admins can set university_id manually; otherwise use the user's own university
     if user.get("is_admin") and payload.university_id:
         university_id = payload.university_id
     else:
@@ -2614,8 +2632,9 @@ async def create_event(payload: EventCreatePayload, user: dict = Depends(get_cur
     return {"ok": True, "event_id": event_id}
 
 @api_router.get("/events")
-def list_events(search: Optional[str] = None, category: Optional[str] = None, user: dict = Depends(get_current_user)):
-    query = sb.table("events").select("*").eq("university_id", user["university_id"]).order("created_at", desc=True)
+def list_events(search: Optional[str] = None, category: Optional[str] = None, university_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    effective_uni = get_effective_university_id(user, university_id)
+    query = sb.table("events").select("*").eq("university_id", effective_uni).order("created_at", desc=True)
     if category and category.lower() != "all":
         query = query.eq("category", category.lower())
     if search:
@@ -2624,8 +2643,9 @@ def list_events(search: Optional[str] = None, category: Optional[str] = None, us
     return events
 
 @api_router.get("/events/{event_id}")
-def get_event(event_id: str, user: dict = Depends(get_current_user)):
-    event = _maybe(sb.table("events").select("*").eq("event_id", event_id).eq("university_id", user["university_id"]).maybe_single().execute())
+def get_event(event_id: str, university_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    effective_uni = get_effective_university_id(user, university_id)
+    event = _maybe(sb.table("events").select("*").eq("event_id", event_id).eq("university_id", effective_uni).maybe_single().execute())
     if not event:
         raise HTTPException(404, "Event not found")
     return event
