@@ -511,11 +511,17 @@ def auth_google(payload: GoogleAuthPayload, request: Request, response: Response
             }).eq("user_id", user_id).execute()
         else:
             user_id = f"user_{uuid.uuid4().hex[:12]}"
-            sb.table("users").insert({
-                "user_id": user_id, "email": email, "name": name, "picture": picture,
-                "university_id": university_id,
-                "created_at": now_iso, "last_active": now_iso,
-            }).execute()
+            try:
+                sb.table("users").insert({
+                    "user_id": user_id, "email": email, "name": name, "picture": picture,
+                    "university_id": university_id,
+                    "created_at": now_iso, "last_active": now_iso,
+                }).execute()
+            except Exception as e:
+                if "duplicate key" in str(e).lower() or "unique constraint" in str(e).lower():
+                    raise HTTPException(409, "An account with this email already exists.")
+                logger.error(f"Google auth insert error: {e}")
+                raise HTTPException(500, "Could not create account. Please try again.")
 
     expires_at = datetime.now(timezone.utc) + timedelta(days=7)
     sb.table("user_sessions").upsert({
@@ -609,11 +615,12 @@ def signup_email(payload: dict, request: Request):
         raise HTTPException(400, "Password must be at least 6 characters")
     if len(password) > 72:
         raise HTTPException(400, "Password too long")
-    existing = _maybe(sb.table("users").select("user_id,deleted").eq("email", email).maybe_single().execute())
+
+    # ---------- FIX: stronger uniqueness check ----------
+    existing = _maybe(sb.table("users").select("user_id, deleted, banned").eq("email", email).maybe_single().execute())
     if existing:
-        if existing.get("deleted"):
-            raise HTTPException(400, "Account with this email was deleted. Contact support.")
-        raise HTTPException(400, "Email already registered")
+        # If an account exists (deleted or not) we block re‑registration
+        raise HTTPException(409, "An account with this email already exists. Please log in or contact support.")
 
     password_hash = bcrypt.hashpw(password[:72].encode("utf-8"), bcrypt.gensalt()).decode()
     user_id = f"user_{uuid.uuid4().hex[:12]}"
@@ -621,14 +628,21 @@ def signup_email(payload: dict, request: Request):
     verification_token = uuid.uuid4().hex
     verification_expires = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
 
-    sb.table("users").insert({
-        "user_id": user_id, "email": email, "name": name,
-        "password_hash": password_hash, "email_verified": False,
-        "verification_token": verification_token,
-        "verification_token_expires": verification_expires,
-        "university_id": university_id,
-        "created_at": now, "last_active": now,
-    }).execute()
+    # ---------- INSERT with error handling for race condition ----------
+    try:
+        sb.table("users").insert({
+            "user_id": user_id, "email": email, "name": name,
+            "password_hash": password_hash, "email_verified": False,
+            "verification_token": verification_token,
+            "verification_token_expires": verification_expires,
+            "university_id": university_id,
+            "created_at": now, "last_active": now,
+        }).execute()
+    except Exception as e:
+        if "duplicate key" in str(e).lower() or "unique constraint" in str(e).lower():
+            raise HTTPException(409, "An account with this email already exists. Please log in or contact support.")
+        logger.error(f"Signup insert error: {e}")
+        raise HTTPException(500, "Could not create account. Please try again.")
 
     verify_link = f"https://campusconnect-app-32.web.app/verify-email?token={verification_token}"
     body = f"<h2>Welcome to VarsityNetwork!</h2><p>Click to verify: <a href='{verify_link}'>{verify_link}</a></p>"
@@ -646,9 +660,24 @@ def login_email(payload: dict, request: Request, response: Response):
         raise HTTPException(401, "Invalid credentials")
     if not bcrypt.checkpw(password[:72].encode("utf-8"), user["password_hash"].encode()):
         raise HTTPException(401, "Invalid credentials")
-    if not user.get("email_verified"):
-        raise HTTPException(403, "Email not verified. Check your inbox.")
 
+    # ---------- NEW: Handle unverified email with automatic resend ----------
+    if not user.get("email_verified"):
+        # Generate a brand-new verification token (always send a fresh one)
+        new_token = uuid.uuid4().hex
+        new_expires = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+        sb.table("users").update({
+            "verification_token": new_token,
+            "verification_token_expires": new_expires
+        }).eq("user_id", user["user_id"]).execute()
+
+        verify_link = f"https://campusconnect-app-32.web.app/verify-email?token={new_token}"
+        body = f"<h2>Email Verification</h2><p>Click to verify: <a href='{verify_link}'>{verify_link}</a></p>"
+        threading.Thread(target=send_email, args=(email, "Verify your email", body)).start()
+
+        raise HTTPException(403, "Your email is not verified. A new verification link has been sent to your inbox.")
+
+    # ---------- Normal login flow ----------
     session_token = f"session_{uuid.uuid4().hex[:32]}"
     expires_at = datetime.now(timezone.utc) + timedelta(days=7)
     sb.table("user_sessions").upsert({
