@@ -1019,6 +1019,9 @@ def get_profile(user: dict) -> dict:
         "onboarding_complete": profile.get("onboarding_complete", False),
     }
 
+
+
+
 @api_router.post("/profile/setup")
 async def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current_user)):
     if not payload.gender.strip() or not payload.year_of_study.strip() or not payload.course.strip() or not payload.campus.strip():
@@ -1062,7 +1065,14 @@ async def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_c
 
     return {"ok": True, "profile": get_profile(user)}
 
-@api_router.put("/profile")
+
+
+
+
+
+
+
+"""@api_router.put("/profile")
 async def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_current_user)):
     updates = {}
     for field in ["date_of_birth", "display_name", "gender", "year_of_study", "course", "campus"]:
@@ -1108,7 +1118,68 @@ async def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get
 
 @api_router.get("/profile")
 def get_my_profile(user: dict = Depends(get_current_user)):
-    return get_profile(user)
+    return get_profile(user)"""
+
+
+
+
+
+@api_router.put("/profile")
+async def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_current_user)):
+    updates = {}
+    for field in ["date_of_birth", "display_name", "gender", "year_of_study", "course", "campus"]:
+        if getattr(payload, field, None) is not None:
+            updates[field] = getattr(payload, field)
+
+    if payload.profile_image is not None:
+        updates["profile_image"] = await process_image_field_async(payload.profile_image, user["user_id"], "profile")
+    if payload.gallery_images is not None:
+        new_gallery = []
+        for i, img in enumerate(payload.gallery_images):
+            new_gallery.append(await process_image_field_async(img, user["user_id"], f"gallery_{i}"))
+        updates["gallery_images"] = new_gallery
+
+    # ---------- NEW: Sync display_name to users.name ----------
+    if "display_name" in updates:
+        sb.table("users").update({"name": updates["display_name"]}).eq("user_id", user["user_id"]).execute()
+    # -----------------------------------------------------------
+
+    if not updates:
+        return {"ok": True, "profile": get_profile(user)}
+
+    existing = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
+    current_profile = existing if existing else {}
+    for k in ["date_of_birth", "gender", "year_of_study", "course", "campus"]:
+        if k in updates:
+            current_profile[k] = updates[k]
+        else:
+            current_profile[k] = current_profile.get(k, "")
+
+    required_fields_present = bool(
+        current_profile.get("date_of_birth") and current_profile.get("gender") and
+        current_profile.get("year_of_study") and current_profile.get("course") and current_profile.get("campus")
+    )
+    if required_fields_present and not current_profile.get("onboarding_complete"):
+        updates["onboarding_complete"] = True
+
+    updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+    if existing:
+        sb.table("user_profiles").update(updates).eq("user_id", user["user_id"]).execute()
+    else:
+        updates["user_id"] = user["user_id"]
+        updates["onboarding_complete"] = required_fields_present
+        updates["created_at"] = datetime.now(timezone.utc).isoformat()
+        sb.table("user_profiles").insert(updates).execute()
+
+    return {"ok": True, "profile": get_profile(user)}
+
+
+
+
+
+
+
+
 
 # ---------- Tutors ----------
 @api_router.post("/tutors")
@@ -2722,3 +2793,61 @@ app.include_router(api_router)
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    @api_router.put("/profile")
+async def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_current_user)):
+    updates = {}
+    for field in ["date_of_birth", "display_name", "gender", "year_of_study", "course", "campus"]:
+        if getattr(payload, field, None) is not None:
+            updates[field] = getattr(payload, field)
+
+    if payload.profile_image is not None:
+        updates["profile_image"] = await process_image_field_async(payload.profile_image, user["user_id"], "profile")
+    if payload.gallery_images is not None:
+        new_gallery = []
+        for i, img in enumerate(payload.gallery_images):
+            new_gallery.append(await process_image_field_async(img, user["user_id"], f"gallery_{i}"))
+        updates["gallery_images"] = new_gallery
+
+    # ---------- NEW: Sync display_name to users.name ----------
+    if "display_name" in updates:
+        sb.table("users").update({"name": updates["display_name"]}).eq("user_id", user["user_id"]).execute()
+    # -----------------------------------------------------------
+
+    if not updates:
+        return {"ok": True, "profile": get_profile(user)}
+
+    existing = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
+    current_profile = existing if existing else {}
+    for k in ["date_of_birth", "gender", "year_of_study", "course", "campus"]:
+        if k in updates:
+            current_profile[k] = updates[k]
+        else:
+            current_profile[k] = current_profile.get(k, "")
+
+    required_fields_present = bool(
+        current_profile.get("date_of_birth") and current_profile.get("gender") and
+        current_profile.get("year_of_study") and current_profile.get("course") and current_profile.get("campus")
+    )
+    if required_fields_present and not current_profile.get("onboarding_complete"):
+        updates["onboarding_complete"] = True
+
+    updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+    if existing:
+        sb.table("user_profiles").update(updates).eq("user_id", user["user_id"]).execute()
+    else:
+        updates["user_id"] = user["user_id"]
+        updates["onboarding_complete"] = required_fields_present
+        updates["created_at"] = datetime.now(timezone.utc).isoformat()
+        sb.table("user_profiles").insert(updates).execute()
+
+    return {"ok": True, "profile": get_profile(user)}
