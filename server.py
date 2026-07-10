@@ -336,13 +336,15 @@ class LostFoundUpdatePayload(BaseModel):
     contact: Optional[str] = None
     status: Optional[str] = None
 
+
+
+# Remove video_url from DirectionCreatePayload and DirectionUpdatePayload
 class DirectionCreatePayload(BaseModel):
     from_location: str
     to_location: str
     duration: str = ""
     mode: str = "walk"
     description: str = ""
-    video_url: str = ""
 
 class DirectionUpdatePayload(BaseModel):
     from_location: Optional[str] = None
@@ -350,7 +352,8 @@ class DirectionUpdatePayload(BaseModel):
     duration: Optional[str] = None
     mode: Optional[str] = None
     description: Optional[str] = None
-    video_url: Optional[str] = None
+    # video_url remains in the database but is not sent by the client
+
 
 class AnnouncementCreatePayload(BaseModel):
     title: str
@@ -2466,11 +2469,49 @@ def delete_lost_found_item(item_id: str, user: dict = Depends(get_current_user))
 
 # ---------- Campus Directions ----------
 @api_router.post("/directions")
-def create_direction(payload: DirectionCreatePayload, user: dict = Depends(get_current_user)):
+async def create_direction(
+    from_location: str = Form(...),
+    to_location: str = Form(...),
+    duration: str = Form(""),
+    mode: str = Form("walk"),
+    description: str = Form(""),
+    video_file: Optional[UploadFile] = File(None),
+    user: dict = Depends(get_current_user)
+):
     if not user.get("university_id"):
         raise HTTPException(400, "University not set")
-    if not payload.from_location.strip() or not payload.to_location.strip():
+    if not from_location.strip() or not to_location.strip():
         raise HTTPException(400, "From and To locations are required")
+
+    video_url = ""
+    if video_file:
+        # Validate type
+        allowed_video_types = ["video/mp4", "video/quicktime", "video/x-msvideo"]
+        if video_file.content_type not in allowed_video_types:
+            raise HTTPException(400, "Only MP4, MOV, AVI files are allowed")
+        # Read content
+        contents = await video_file.read()
+        max_size = 15 * 1024 * 1024  # 15 MB
+        if len(contents) > max_size:
+            raise HTTPException(400, "Video must be less than 15 MB")
+
+        # Compress video
+        compressed = await asyncio.get_running_loop().run_in_executor(
+            None, compress_video_sync, contents, video_file.filename
+        )
+        # Upload to Supabase Storage
+        prefix = "dir_vid"
+        filename = f"{prefix}_{uuid.uuid4().hex[:8]}.mp4"
+        path = f"{user['user_id']}/{filename}"
+        sb.storage.from_(STORAGE_BUCKET).upload(
+            path=path,
+            file=compressed,
+            file_options={
+                "content-type": "video/mp4",
+                "cache-control": "public, max-age=31536000, immutable"
+            }
+        )
+        video_url = f"{SUPABASE_URL}/storage/v1/object/public/{STORAGE_BUCKET}/{path}"
 
     route_id = f"dir_{uuid.uuid4().hex[:12]}"
     now = datetime.now(timezone.utc).isoformat()
@@ -2479,12 +2520,12 @@ def create_direction(payload: DirectionCreatePayload, user: dict = Depends(get_c
         "route_id": route_id,
         "user_id": user["user_id"],
         "university_id": user["university_id"],
-        "from_location": payload.from_location.strip(),
-        "to_location": payload.to_location.strip(),
-        "duration": payload.duration.strip(),
-        "mode": payload.mode.strip() or "walk",
-        "description": payload.description.strip(),
-        "video_url": payload.video_url.strip(),
+        "from_location": from_location.strip(),
+        "to_location": to_location.strip(),
+        "duration": duration.strip(),
+        "mode": mode.strip() or "walk",
+        "description": description.strip(),
+        "video_url": video_url,
         "created_at": now
     }).execute()
 
@@ -2943,4 +2984,6 @@ app.include_router(api_router)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))  
+    
+   
