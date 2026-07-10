@@ -1,9 +1,9 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, Cookie, Header, UploadFile, File
+from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, Cookie, Header, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
-import os, logging, uuid, math, httpx, asyncio, time, base64, bcrypt, smtplib, re, json
+import os, logging, uuid, math, httpx, asyncio, time, base64, bcrypt, smtplib, re, json, subprocess, tempfile
 from pathlib import Path
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -182,6 +182,50 @@ async def process_image_field_async(image_value: str, user_id: str, filename_pre
         return public_url
     return image_value
 
+# ---------- Video compression ----------
+def get_video_duration(file_path: str) -> float:
+    """Return duration in seconds using ffprobe."""
+    cmd = [
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", file_path
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise HTTPException(400, "Could not read video duration")
+    return float(result.stdout.strip())
+
+def compress_video_sync(file_bytes: bytes, filename: str) -> bytes:
+    """Compress video to roughly 5 MB using ffmpeg."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_in:
+        tmp_in.write(file_bytes)
+        input_path = tmp_in.name
+
+    output_path = input_path + "_compressed.mp4"
+    try:
+        duration = get_video_duration(input_path)
+        if duration > 300:  # 5 minutes
+            raise HTTPException(400, "Video must be less than 5 minutes")
+
+        # Calculate target bitrate: 5 MB * 8 = 40 Mbits, minus audio allowance
+        target_total_bitrate = int((5 * 8 * 1000) / duration) - 128  # kbps
+        target_total_bitrate = max(target_total_bitrate, 500)  # at least 500 kbps
+
+        cmd = [
+            "ffmpeg", "-y", "-i", input_path,
+            "-c:v", "libx264", "-b:v", f"{target_total_bitrate}k",
+            "-c:a", "aac", "-b:a", "128k",
+            "-preset", "fast", "-movflags", "+faststart",
+            output_path
+        ]
+        subprocess.run(cmd, check=True, capture_output=True)
+        with open(output_path, "rb") as f:
+            compressed = f.read()
+        return compressed
+    finally:
+        os.unlink(input_path)
+        if os.path.exists(output_path):
+            os.unlink(output_path)
+
 # ---------- Models ----------
 class LocationUpdatePayload(BaseModel):
     latitude: float
@@ -336,9 +380,6 @@ class LostFoundUpdatePayload(BaseModel):
     contact: Optional[str] = None
     status: Optional[str] = None
 
-
-
-# Remove video_url from DirectionCreatePayload and DirectionUpdatePayload
 class DirectionCreatePayload(BaseModel):
     from_location: str
     to_location: str
@@ -352,8 +393,6 @@ class DirectionUpdatePayload(BaseModel):
     duration: Optional[str] = None
     mode: Optional[str] = None
     description: Optional[str] = None
-    # video_url remains in the database but is not sent by the client
-
 
 class AnnouncementCreatePayload(BaseModel):
     title: str
@@ -1059,7 +1098,6 @@ async def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_c
 
     return {"ok": True, "profile": get_profile(user)}
 
-# ✅ Added GET /profile
 @api_router.get("/profile")
 def get_my_profile(user: dict = Depends(get_current_user)):
     return get_profile(user)
@@ -1171,7 +1209,6 @@ def list_tutors(search: Optional[str] = None, university_id: Optional[str] = Non
             t["rating_count"] = cnt
     return tutors
 
-# ✅ Moved /myads/count BEFORE the parameterised route
 @api_router.get("/tutors/myads/count")
 def my_tutor_ads_count(user: dict = Depends(get_current_user)):
     res = sb.table("tutors").select("tutor_id", count="exact").eq("user_id", user["user_id"]).execute()
@@ -1919,7 +1956,6 @@ def list_bursaries(faculty: Optional[str] = None, search: Optional[str] = None, 
 
     return bursaries
 
-# ✅ Moved /my-count BEFORE the parameterised route
 @api_router.get("/bursaries/my-count")
 def my_bursaries_count(user: dict = Depends(get_current_user)):
     res = sb.table("bursaries").select("bursary_id", count="exact").eq("user_id", user["user_id"]).execute()
@@ -2282,7 +2318,6 @@ def list_notes(search: Optional[str] = None, university_id: Optional[str] = None
             n["rating_count"] = cnt
     return notes
 
-# ✅ Moved /my-count BEFORE the parameterised route
 @api_router.get("/notes/my-count")
 def my_notes_count(user: dict = Depends(get_current_user)):
     res = sb.table("notes").select("note_id", count="exact").eq("user_id", user["user_id"]).execute()
@@ -2984,6 +3019,4 @@ app.include_router(api_router)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))  
-    
-   
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
