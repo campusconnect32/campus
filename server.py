@@ -616,10 +616,8 @@ def signup_email(payload: dict, request: Request):
     if len(password) > 72:
         raise HTTPException(400, "Password too long")
 
-    # ---------- FIX: stronger uniqueness check ----------
     existing = _maybe(sb.table("users").select("user_id, deleted, banned").eq("email", email).maybe_single().execute())
     if existing:
-        # If an account exists (deleted or not) we block re‑registration
         raise HTTPException(409, "An account with this email already exists. Please log in or contact support.")
 
     password_hash = bcrypt.hashpw(password[:72].encode("utf-8"), bcrypt.gensalt()).decode()
@@ -628,7 +626,6 @@ def signup_email(payload: dict, request: Request):
     verification_token = uuid.uuid4().hex
     verification_expires = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
 
-    # ---------- INSERT with error handling for race condition ----------
     try:
         sb.table("users").insert({
             "user_id": user_id, "email": email, "name": name,
@@ -661,9 +658,7 @@ def login_email(payload: dict, request: Request, response: Response):
     if not bcrypt.checkpw(password[:72].encode("utf-8"), user["password_hash"].encode()):
         raise HTTPException(401, "Invalid credentials")
 
-    # ---------- NEW: Handle unverified email with automatic resend ----------
     if not user.get("email_verified"):
-        # Generate a brand-new verification token (always send a fresh one)
         new_token = uuid.uuid4().hex
         new_expires = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
         sb.table("users").update({
@@ -677,7 +672,6 @@ def login_email(payload: dict, request: Request, response: Response):
 
         raise HTTPException(403, "Your email is not verified. A new verification link has been sent to your inbox.")
 
-    # ---------- Normal login flow ----------
     session_token = f"session_{uuid.uuid4().hex[:32]}"
     expires_at = datetime.now(timezone.utc) + timedelta(days=7)
     sb.table("user_sessions").upsert({
@@ -1019,9 +1013,6 @@ def get_profile(user: dict) -> dict:
         "onboarding_complete": profile.get("onboarding_complete", False),
     }
 
-
-
-
 @api_router.post("/profile/setup")
 async def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current_user)):
     if not payload.gender.strip() or not payload.year_of_study.strip() or not payload.course.strip() or not payload.campus.strip():
@@ -1065,64 +1056,10 @@ async def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_c
 
     return {"ok": True, "profile": get_profile(user)}
 
-
-
-
-
-
-
-
-"""@api_router.put("/profile")
-async def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_current_user)):
-    updates = {}
-    for field in ["date_of_birth", "display_name", "gender", "year_of_study", "course", "campus"]:
-        if getattr(payload, field, None) is not None:
-            updates[field] = getattr(payload, field)
-
-    if payload.profile_image is not None:
-        updates["profile_image"] = await process_image_field_async(payload.profile_image, user["user_id"], "profile")
-    if payload.gallery_images is not None:
-        new_gallery = []
-        for i, img in enumerate(payload.gallery_images):
-            new_gallery.append(await process_image_field_async(img, user["user_id"], f"gallery_{i}"))
-        updates["gallery_images"] = new_gallery
-
-    if not updates:
-        return {"ok": True, "profile": get_profile(user)}
-
-    existing = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
-    current_profile = existing if existing else {}
-    for k in ["date_of_birth", "gender", "year_of_study", "course", "campus"]:
-        if k in updates:
-            current_profile[k] = updates[k]
-        else:
-            current_profile[k] = current_profile.get(k, "")
-
-    required_fields_present = bool(
-        current_profile.get("date_of_birth") and current_profile.get("gender") and
-        current_profile.get("year_of_study") and current_profile.get("course") and current_profile.get("campus")
-    )
-    if required_fields_present and not current_profile.get("onboarding_complete"):
-        updates["onboarding_complete"] = True
-
-    updates["updated_at"] = datetime.now(timezone.utc).isoformat()
-    if existing:
-        sb.table("user_profiles").update(updates).eq("user_id", user["user_id"]).execute()
-    else:
-        updates["user_id"] = user["user_id"]
-        updates["onboarding_complete"] = required_fields_present
-        updates["created_at"] = datetime.now(timezone.utc).isoformat()
-        sb.table("user_profiles").insert(updates).execute()
-
-    return {"ok": True, "profile": get_profile(user)}
-
+# ✅ Added GET /profile
 @api_router.get("/profile")
 def get_my_profile(user: dict = Depends(get_current_user)):
-    return get_profile(user)"""
-
-
-
-
+    return get_profile(user)
 
 @api_router.put("/profile")
 async def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_current_user)):
@@ -1139,10 +1076,9 @@ async def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get
             new_gallery.append(await process_image_field_async(img, user["user_id"], f"gallery_{i}"))
         updates["gallery_images"] = new_gallery
 
-    # ---------- NEW: Sync display_name to users.name ----------
+    # Sync display_name to users.name
     if "display_name" in updates:
         sb.table("users").update({"name": updates["display_name"]}).eq("user_id", user["user_id"]).execute()
-    # -----------------------------------------------------------
 
     if not updates:
         return {"ok": True, "profile": get_profile(user)}
@@ -1172,14 +1108,6 @@ async def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get
         sb.table("user_profiles").insert(updates).execute()
 
     return {"ok": True, "profile": get_profile(user)}
-
-
-
-
-
-
-
-
 
 # ---------- Tutors ----------
 @api_router.post("/tutors")
@@ -1239,6 +1167,13 @@ def list_tutors(search: Optional[str] = None, university_id: Optional[str] = Non
             t["average_rating"] = round(rating_sums[tid] / cnt, 1) if cnt else 0
             t["rating_count"] = cnt
     return tutors
+
+# ✅ Moved /myads/count BEFORE the parameterised route
+@api_router.get("/tutors/myads/count")
+def my_tutor_ads_count(user: dict = Depends(get_current_user)):
+    res = sb.table("tutors").select("tutor_id", count="exact").eq("user_id", user["user_id"]).execute()
+    count = res.count if hasattr(res, 'count') else 0
+    return {"count": count}
 
 @api_router.get("/tutors/{tutor_id}")
 def get_tutor(tutor_id: str, university_id: Optional[str] = None, user: dict = Depends(get_current_user)):
@@ -1372,12 +1307,6 @@ def get_my_rating(tutor_id: str, user: dict = Depends(get_current_user)):
         .gt("rating", 0)
         .maybe_single().execute())
     return {"rating": review["rating"] if review else 0}
-
-@api_router.get("/tutors/myads/count")
-def my_tutor_ads_count(user: dict = Depends(get_current_user)):
-    res = sb.table("tutors").select("tutor_id", count="exact").eq("user_id", user["user_id"]).execute()
-    count = res.count if hasattr(res, 'count') else 0
-    return {"count": count}
 
 # ---------- Marketplace ----------
 PRESET_CATEGORIES = [
@@ -1987,6 +1916,13 @@ def list_bursaries(faculty: Optional[str] = None, search: Optional[str] = None, 
 
     return bursaries
 
+# ✅ Moved /my-count BEFORE the parameterised route
+@api_router.get("/bursaries/my-count")
+def my_bursaries_count(user: dict = Depends(get_current_user)):
+    res = sb.table("bursaries").select("bursary_id", count="exact").eq("user_id", user["user_id"]).execute()
+    count = res.count if hasattr(res, 'count') else 0
+    return {"count": count}
+
 @api_router.get("/bursaries/{bursary_id}")
 def get_bursary(bursary_id: str, university_id: Optional[str] = None, user: dict = Depends(get_current_user)):
     effective_uni = get_effective_university_id(user, university_id)
@@ -2030,12 +1966,6 @@ def delete_bursary(bursary_id: str, user: dict = Depends(get_current_user)):
         raise HTTPException(403, "You can only delete your own posts")
     sb.table("bursaries").delete().eq("bursary_id", bursary_id).execute()
     return {"ok": True}
-
-@api_router.get("/bursaries/my-count")
-def my_bursaries_count(user: dict = Depends(get_current_user)):
-    res = sb.table("bursaries").select("bursary_id", count="exact").eq("user_id", user["user_id"]).execute()
-    count = res.count if hasattr(res, 'count') else 0
-    return {"count": count}
 
 # ---------- Bursary Chat ----------
 @api_router.post("/bursaries/{bursary_id}/messages")
@@ -2349,6 +2279,13 @@ def list_notes(search: Optional[str] = None, university_id: Optional[str] = None
             n["rating_count"] = cnt
     return notes
 
+# ✅ Moved /my-count BEFORE the parameterised route
+@api_router.get("/notes/my-count")
+def my_notes_count(user: dict = Depends(get_current_user)):
+    res = sb.table("notes").select("note_id", count="exact").eq("user_id", user["user_id"]).execute()
+    count = res.count if hasattr(res, 'count') else 0
+    return {"count": count}
+
 @api_router.get("/notes/{note_id}")
 def get_note(note_id: str, university_id: Optional[str] = None, user: dict = Depends(get_current_user)):
     effective_uni = get_effective_university_id(user, university_id)
@@ -2402,12 +2339,6 @@ def delete_note(note_id: str, user: dict = Depends(get_current_user)):
         raise HTTPException(403, "You can only delete your own ads")
     sb.table("notes").delete().eq("note_id", note_id).execute()
     return {"ok": True}
-
-@api_router.get("/notes/my-count")
-def my_notes_count(user: dict = Depends(get_current_user)):
-    res = sb.table("notes").select("note_id", count="exact").eq("user_id", user["user_id"]).execute()
-    count = res.count if hasattr(res, 'count') else 0
-    return {"count": count}
 
 # ---------- Note Reviews ----------
 @api_router.post("/notes/{note_id}/reviews")
@@ -2787,8 +2718,6 @@ def delete_event(event_id: str, user: dict = Depends(get_current_user)):
     sb.table("events").delete().eq("event_id", event_id).execute()
     return {"ok": True}
 
-
-
 # ---------- Resources (Google Drive links) ----------
 @api_router.post("/resources")
 def create_resource(payload: dict, user: dict = Depends(get_current_user)):
@@ -2841,8 +2770,6 @@ def delete_resource(resource_id: str, user: dict = Depends(get_current_user)):
         raise HTTPException(403, "Not allowed")
     sb.table("resources").delete().eq("resource_id", resource_id).execute()
     return {"ok": True}
-
-
 
 # ---------- Social Groups (WhatsApp‑like) ----------
 @api_router.post("/social/groups")
@@ -3011,14 +2938,9 @@ def get_social_group_messages(group_id: str, limit: int = 50, before: Optional[s
             m["reply_to"] = None
     return messages
 
-
 # ---------- Mount router ----------
 app.include_router(api_router)
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
-    
-    
-    
-    
