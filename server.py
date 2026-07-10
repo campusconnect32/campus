@@ -2787,6 +2787,231 @@ def delete_event(event_id: str, user: dict = Depends(get_current_user)):
     sb.table("events").delete().eq("event_id", event_id).execute()
     return {"ok": True}
 
+
+
+# ---------- Resources (Google Drive links) ----------
+@api_router.post("/resources")
+def create_resource(payload: dict, user: dict = Depends(get_current_user)):
+    if not user.get("university_id"):
+        raise HTTPException(400, "University not set")
+    course_name = payload.get("course_name", "").strip()
+    course_code = payload.get("course_code", "").strip()
+    link = payload.get("google_drive_link", "").strip()
+    if not course_name or not course_code or not link:
+        raise HTTPException(400, "Course name, code and Google Drive link are required")
+    # Basic Google Drive link validation
+    if not (link.startswith("https://drive.google.com/") or link.startswith("https://docs.google.com/")):
+        raise HTTPException(400, "Only Google Drive links are allowed")
+
+    resource_id = f"res_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+    sb.table("resources").insert({
+        "resource_id": resource_id,
+        "user_id": user["user_id"],
+        "university_id": user["university_id"],
+        "course_name": course_name,
+        "course_code": course_code.upper(),
+        "google_drive_link": link,
+        "created_at": now
+    }).execute()
+    return {"ok": True, "resource_id": resource_id}
+
+@api_router.get("/resources")
+def list_resources(search: Optional[str] = None, university_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    effective_uni = get_effective_university_id(user, university_id)
+    query = sb.table("resources").select("*").eq("university_id", effective_uni).order("created_at", desc=True)
+    if search:
+        query = query.ilike("course_code", f"%{search}%")
+    resources = query.execute().data or []
+    # Attach submitter name
+    if resources:
+        user_ids = list({r["user_id"] for r in resources})
+        profiles = sb.table("user_profiles").select("user_id, display_name").in_("user_id", user_ids).execute().data or []
+        pmap = {p["user_id"]: p.get("display_name") or "Unknown" for p in profiles}
+        for r in resources:
+            r["submitted_by"] = pmap.get(r["user_id"], "Unknown")
+    return resources
+
+@api_router.delete("/resources/{resource_id}")
+def delete_resource(resource_id: str, user: dict = Depends(get_current_user)):
+    res = _maybe(sb.table("resources").select("*").eq("resource_id", resource_id).maybe_single().execute())
+    if not res:
+        raise HTTPException(404, "Resource not found")
+    if res["user_id"] != user["user_id"] and not user.get("is_admin"):
+        raise HTTPException(403, "Not allowed")
+    sb.table("resources").delete().eq("resource_id", resource_id).execute()
+    return {"ok": True}
+
+
+
+# ---------- Social Groups (WhatsApp‑like) ----------
+@api_router.post("/social/groups")
+def create_social_group(payload: dict, user: dict = Depends(get_current_user)):
+    if not user.get("university_id"):
+        raise HTTPException(400, "University not set")
+    name = payload.get("name", "").strip()
+    description = payload.get("description", "").strip()
+    course_code = payload.get("course_code", "").strip()
+    if not name or not course_code:
+        raise HTTPException(400, "Group name and course code are required")
+
+    group_id = f"sg_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+    sb.table("social_groups").insert({
+        "group_id": group_id,
+        "creator_id": user["user_id"],
+        "university_id": user["university_id"],
+        "name": name,
+        "description": description,
+        "course_code": course_code.upper(),
+        "created_at": now
+    }).execute()
+    # Auto‑join creator as admin
+    member_id = f"sgm_{uuid.uuid4().hex[:12]}"
+    sb.table("social_group_members").insert({
+        "member_id": member_id,
+        "group_id": group_id,
+        "user_id": user["user_id"],
+        "role": "admin",
+        "joined_at": now
+    }).execute()
+    return {"ok": True, "group_id": group_id}
+
+@api_router.get("/social/groups")
+def list_social_groups(search: Optional[str] = None, university_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    effective_uni = get_effective_university_id(user, university_id)
+    query = sb.table("social_groups").select("*").eq("university_id", effective_uni).order("created_at", desc=True)
+    if search:
+        query = query.ilike("course_code", f"%{search}%")
+    groups = query.execute().data or []
+    # Attach member count and whether current user is a member
+    for g in groups:
+        cnt = sb.table("social_group_members").select("member_id", count="exact").eq("group_id", g["group_id"]).execute()
+        g["member_count"] = cnt.count if hasattr(cnt, 'count') else 0
+        membership = _maybe(sb.table("social_group_members").select("role").eq("group_id", g["group_id"]).eq("user_id", user["user_id"]).maybe_single().execute())
+        g["is_member"] = membership is not None
+        g["role"] = membership["role"] if membership else None
+    return groups
+
+@api_router.get("/social/groups/my")
+def my_social_groups(user: dict = Depends(get_current_user)):
+    memberships = sb.table("social_group_members").select("group_id").eq("user_id", user["user_id"]).execute().data or []
+    if not memberships:
+        return []
+    group_ids = [m["group_id"] for m in memberships]
+    groups = sb.table("social_groups").select("*").in_("group_id", group_ids).order("created_at", desc=True).execute().data or []
+    for g in groups:
+        cnt = sb.table("social_group_members").select("member_id", count="exact").eq("group_id", g["group_id"]).execute()
+        g["member_count"] = cnt.count if hasattr(cnt, 'count') else 0
+    return groups
+
+@api_router.post("/social/groups/{group_id}/join")
+def join_social_group(group_id: str, user: dict = Depends(get_current_user)):
+    group = _maybe(sb.table("social_groups").select("*").eq("group_id", group_id).maybe_single().execute())
+    if not group:
+        raise HTTPException(404, "Group not found")
+    existing = _maybe(sb.table("social_group_members").select("member_id").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute())
+    if existing:
+        raise HTTPException(400, "Already a member")
+    member_id = f"sgm_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+    sb.table("social_group_members").insert({
+        "member_id": member_id,
+        "group_id": group_id,
+        "user_id": user["user_id"],
+        "role": "member",
+        "joined_at": now
+    }).execute()
+    return {"ok": True}
+
+@api_router.post("/social/groups/{group_id}/leave")
+def leave_social_group(group_id: str, user: dict = Depends(get_current_user)):
+    # Prevent last admin from leaving? For simplicity, allow.
+    sb.table("social_group_members").delete().eq("group_id", group_id).eq("user_id", user["user_id"]).execute()
+    return {"ok": True}
+
+@api_router.get("/social/groups/{group_id}/members")
+def list_social_group_members(group_id: str, user: dict = Depends(get_current_user)):
+    members = sb.table("social_group_members").select("member_id, user_id, role, joined_at").eq("group_id", group_id).execute().data or []
+    user_ids = [m["user_id"] for m in members]
+    profiles = sb.table("user_profiles").select("user_id, display_name, profile_image").in_("user_id", user_ids).execute().data or []
+    pmap = {p["user_id"]: p for p in profiles}
+    for m in members:
+        p = pmap.get(m["user_id"], {})
+        m["display_name"] = p.get("display_name") or "Unknown"
+        m["profile_image"] = p.get("profile_image") or ""
+    return members
+
+# ---------- Social Group Chat (WhatsApp‑like) ----------
+@api_router.post("/social/groups/{group_id}/messages")
+async def send_social_group_message(group_id: str, payload: dict, user: dict = Depends(get_current_user)):
+    # Ensure membership
+    member = _maybe(sb.table("social_group_members").select("member_id").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute())
+    if not member:
+        raise HTTPException(403, "You must be a member to send messages")
+    
+    content = payload.get("content", "").strip()
+    image = payload.get("image", "").strip()
+    reply_to_id = payload.get("reply_to_id", None)
+    if not content and not image:
+        raise HTTPException(400, "Message must contain text or an image")
+
+    # If image provided, process it
+    image_url = ""
+    if image:
+        image_url = await process_image_field_async(image, user["user_id"], "social_msg")
+    
+    if reply_to_id:
+        ref = _maybe(sb.table("social_group_messages").select("message_id").eq("message_id", reply_to_id).maybe_single().execute())
+        if not ref:
+            raise HTTPException(404, "Referenced message not found")
+
+    message_id = f"sgmsg_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+    sb.table("social_group_messages").insert({
+        "message_id": message_id,
+        "group_id": group_id,
+        "sender_id": user["user_id"],
+        "content": content,
+        "image": image_url,
+        "reply_to_id": reply_to_id,
+        "created_at": now
+    }).execute()
+    return {"ok": True, "message_id": message_id}
+
+@api_router.get("/social/groups/{group_id}/messages")
+def get_social_group_messages(group_id: str, limit: int = 50, before: Optional[str] = None, user: dict = Depends(get_current_user)):
+    member = _maybe(sb.table("social_group_members").select("member_id").eq("group_id", group_id).eq("user_id", user["user_id"]).maybe_single().execute())
+    if not member:
+        raise HTTPException(403, "You must be a member to view messages")
+    query = sb.table("social_group_messages").select("*").eq("group_id", group_id).order("created_at", desc=True).limit(limit)
+    if before:
+        query = query.lt("created_at", before)
+    messages = query.execute().data or []
+    messages.reverse()
+
+    sender_ids = list({m["sender_id"] for m in messages})
+    profiles = sb.table("user_profiles").select("user_id, display_name, profile_image").in_("user_id", sender_ids).execute().data or []
+    pmap = {p["user_id"]: p for p in profiles}
+    for m in messages:
+        p = pmap.get(m["sender_id"], {})
+        m["sender_name"] = p.get("display_name") or "Unknown"
+        m["sender_picture"] = p.get("profile_image") or ""
+        if m.get("reply_to_id"):
+            reply_msg = _maybe(sb.table("social_group_messages").select("content, sender_id").eq("message_id", m["reply_to_id"]).maybe_single().execute())
+            if reply_msg:
+                rp = pmap.get(reply_msg["sender_id"], {})
+                m["reply_to"] = {
+                    "content": reply_msg["content"],
+                    "sender_name": rp.get("display_name") or "Unknown"
+                }
+            else:
+                m["reply_to"] = None
+        else:
+            m["reply_to"] = None
+    return messages
+
+
 # ---------- Mount router ----------
 app.include_router(api_router)
 
@@ -2797,57 +3022,3 @@ if __name__ == "__main__":
     
     
     
-    
-    
-    
-    
-    
-    
-    @api_router.put("/profile")
-async def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_current_user)):
-    updates = {}
-    for field in ["date_of_birth", "display_name", "gender", "year_of_study", "course", "campus"]:
-        if getattr(payload, field, None) is not None:
-            updates[field] = getattr(payload, field)
-
-    if payload.profile_image is not None:
-        updates["profile_image"] = await process_image_field_async(payload.profile_image, user["user_id"], "profile")
-    if payload.gallery_images is not None:
-        new_gallery = []
-        for i, img in enumerate(payload.gallery_images):
-            new_gallery.append(await process_image_field_async(img, user["user_id"], f"gallery_{i}"))
-        updates["gallery_images"] = new_gallery
-
-    # ---------- NEW: Sync display_name to users.name ----------
-    if "display_name" in updates:
-        sb.table("users").update({"name": updates["display_name"]}).eq("user_id", user["user_id"]).execute()
-    # -----------------------------------------------------------
-
-    if not updates:
-        return {"ok": True, "profile": get_profile(user)}
-
-    existing = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
-    current_profile = existing if existing else {}
-    for k in ["date_of_birth", "gender", "year_of_study", "course", "campus"]:
-        if k in updates:
-            current_profile[k] = updates[k]
-        else:
-            current_profile[k] = current_profile.get(k, "")
-
-    required_fields_present = bool(
-        current_profile.get("date_of_birth") and current_profile.get("gender") and
-        current_profile.get("year_of_study") and current_profile.get("course") and current_profile.get("campus")
-    )
-    if required_fields_present and not current_profile.get("onboarding_complete"):
-        updates["onboarding_complete"] = True
-
-    updates["updated_at"] = datetime.now(timezone.utc).isoformat()
-    if existing:
-        sb.table("user_profiles").update(updates).eq("user_id", user["user_id"]).execute()
-    else:
-        updates["user_id"] = user["user_id"]
-        updates["onboarding_complete"] = required_fields_present
-        updates["created_at"] = datetime.now(timezone.utc).isoformat()
-        sb.table("user_profiles").insert(updates).execute()
-
-    return {"ok": True, "profile": get_profile(user)}
