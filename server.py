@@ -1,9 +1,9 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, Cookie, Header, UploadFile, File, Form
+from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, Cookie, Header, UploadFile, File
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
-import os, logging, uuid, math, httpx, asyncio, time, base64, bcrypt, smtplib, re, json, subprocess, tempfile
+import os, logging, uuid, math, httpx, asyncio, time, base64, bcrypt, smtplib, re, json
 from pathlib import Path
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -182,50 +182,6 @@ async def process_image_field_async(image_value: str, user_id: str, filename_pre
         return public_url
     return image_value
 
-# ---------- Video compression ----------
-def get_video_duration(file_path: str) -> float:
-    """Return duration in seconds using ffprobe."""
-    cmd = [
-        "ffprobe", "-v", "error", "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1", file_path
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise HTTPException(400, "Could not read video duration")
-    return float(result.stdout.strip())
-
-def compress_video_sync(file_bytes: bytes, filename: str) -> bytes:
-    """Compress video to roughly 5 MB using ffmpeg."""
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_in:
-        tmp_in.write(file_bytes)
-        input_path = tmp_in.name
-
-    output_path = input_path + "_compressed.mp4"
-    try:
-        duration = get_video_duration(input_path)
-        if duration > 300:  # 5 minutes
-            raise HTTPException(400, "Video must be less than 5 minutes")
-
-        # Calculate target bitrate: 5 MB * 8 = 40 Mbits, minus audio allowance
-        target_total_bitrate = int((5 * 8 * 1000) / duration) - 128  # kbps
-        target_total_bitrate = max(target_total_bitrate, 500)  # at least 500 kbps
-
-        cmd = [
-            "ffmpeg", "-y", "-i", input_path,
-            "-c:v", "libx264", "-b:v", f"{target_total_bitrate}k",
-            "-c:a", "aac", "-b:a", "128k",
-            "-preset", "fast", "-movflags", "+faststart",
-            output_path
-        ]
-        subprocess.run(cmd, check=True, capture_output=True)
-        with open(output_path, "rb") as f:
-            compressed = f.read()
-        return compressed
-    finally:
-        os.unlink(input_path)
-        if os.path.exists(output_path):
-            os.unlink(output_path)
-
 # ---------- Models ----------
 class LocationUpdatePayload(BaseModel):
     latitude: float
@@ -386,6 +342,7 @@ class DirectionCreatePayload(BaseModel):
     duration: str = ""
     mode: str = "walk"
     description: str = ""
+    video_url: str = ""
 
 class DirectionUpdatePayload(BaseModel):
     from_location: Optional[str] = None
@@ -393,6 +350,7 @@ class DirectionUpdatePayload(BaseModel):
     duration: Optional[str] = None
     mode: Optional[str] = None
     description: Optional[str] = None
+    video_url: Optional[str] = None
 
 class AnnouncementCreatePayload(BaseModel):
     title: str
@@ -1098,6 +1056,7 @@ async def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_c
 
     return {"ok": True, "profile": get_profile(user)}
 
+# ✅ Added GET /profile
 @api_router.get("/profile")
 def get_my_profile(user: dict = Depends(get_current_user)):
     return get_profile(user)
@@ -1209,6 +1168,7 @@ def list_tutors(search: Optional[str] = None, university_id: Optional[str] = Non
             t["rating_count"] = cnt
     return tutors
 
+# ✅ Moved /myads/count BEFORE the parameterised route
 @api_router.get("/tutors/myads/count")
 def my_tutor_ads_count(user: dict = Depends(get_current_user)):
     res = sb.table("tutors").select("tutor_id", count="exact").eq("user_id", user["user_id"]).execute()
@@ -1956,6 +1916,7 @@ def list_bursaries(faculty: Optional[str] = None, search: Optional[str] = None, 
 
     return bursaries
 
+# ✅ Moved /my-count BEFORE the parameterised route
 @api_router.get("/bursaries/my-count")
 def my_bursaries_count(user: dict = Depends(get_current_user)):
     res = sb.table("bursaries").select("bursary_id", count="exact").eq("user_id", user["user_id"]).execute()
@@ -2318,6 +2279,7 @@ def list_notes(search: Optional[str] = None, university_id: Optional[str] = None
             n["rating_count"] = cnt
     return notes
 
+# ✅ Moved /my-count BEFORE the parameterised route
 @api_router.get("/notes/my-count")
 def my_notes_count(user: dict = Depends(get_current_user)):
     res = sb.table("notes").select("note_id", count="exact").eq("user_id", user["user_id"]).execute()
@@ -2504,45 +2466,11 @@ def delete_lost_found_item(item_id: str, user: dict = Depends(get_current_user))
 
 # ---------- Campus Directions ----------
 @api_router.post("/directions")
-async def create_direction(
-    from_location: str = Form(...),
-    to_location: str = Form(...),
-    duration: str = Form(""),
-    mode: str = Form("walk"),
-    description: str = Form(""),
-    video_file: Optional[UploadFile] = File(None),
-    user: dict = Depends(get_current_user)
-):
+def create_direction(payload: DirectionCreatePayload, user: dict = Depends(get_current_user)):
     if not user.get("university_id"):
         raise HTTPException(400, "University not set")
-    if not from_location.strip() or not to_location.strip():
+    if not payload.from_location.strip() or not payload.to_location.strip():
         raise HTTPException(400, "From and To locations are required")
-
-    video_url = ""
-    if video_file:
-        # Validate type
-        allowed_video_types = ["video/mp4", "video/quicktime", "video/x-msvideo"]
-        if video_file.content_type not in allowed_video_types:
-            raise HTTPException(400, "Only MP4, MOV, AVI files are allowed")
-
-        contents = await video_file.read()
-        max_size = 15 * 1024 * 1024  # 15 MB
-        if len(contents) > max_size:
-            raise HTTPException(400, "Video must be less than 15 MB")
-
-        # Upload directly to Supabase Storage (no compression)
-        prefix = "dir_vid"
-        filename = f"{prefix}_{uuid.uuid4().hex[:8]}.mp4"
-        path = f"{user['user_id']}/{filename}"
-        sb.storage.from_(STORAGE_BUCKET).upload(
-            path=path,
-            file=contents,
-            file_options={
-                "content-type": video_file.content_type,
-                "cache-control": "public, max-age=31536000, immutable"
-            }
-        )
-        video_url = f"{SUPABASE_URL}/storage/v1/object/public/{STORAGE_BUCKET}/{path}"
 
     route_id = f"dir_{uuid.uuid4().hex[:12]}"
     now = datetime.now(timezone.utc).isoformat()
@@ -2551,12 +2479,12 @@ async def create_direction(
         "route_id": route_id,
         "user_id": user["user_id"],
         "university_id": user["university_id"],
-        "from_location": from_location.strip(),
-        "to_location": to_location.strip(),
-        "duration": duration.strip(),
-        "mode": mode.strip() or "walk",
-        "description": description.strip(),
-        "video_url": video_url,
+        "from_location": payload.from_location.strip(),
+        "to_location": payload.to_location.strip(),
+        "duration": payload.duration.strip(),
+        "mode": payload.mode.strip() or "walk",
+        "description": payload.description.strip(),
+        "video_url": payload.video_url.strip(),
         "created_at": now
     }).execute()
 
@@ -3015,5 +2943,4 @@ app.include_router(api_router)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))  
-    
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
