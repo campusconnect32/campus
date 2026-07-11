@@ -2938,6 +2938,45 @@ def get_social_group_messages(group_id: str, limit: int = 50, before: Optional[s
             m["reply_to"] = None
     return messages
 
+
+
+# ---------- Feedback ----------
+@api_router.post("/feedback")
+def submit_feedback(payload: dict, user: dict = Depends(get_current_user)):
+    message = payload.get("message", "").strip()
+    category = payload.get("category", "suggestion").strip()
+    if not message:
+        raise HTTPException(400, "Feedback message cannot be empty")
+    if category not in ("suggestion", "bug", "praise", "other"):
+        category = "suggestion"
+
+    feedback_id = f"fb_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+    sb.table("feedback").insert({
+        "feedback_id": feedback_id,
+        "user_id": user["user_id"],
+        "message": message,
+        "category": category,
+        "created_at": now
+    }).execute()
+    return {"ok": True, "feedback_id": feedback_id}
+
+@api_router.get("/admin/feedback")
+def list_feedback(user: dict = Depends(require_admin)):
+    # Fetch all feedback, newest first, and attach user name & picture
+    feedbacks = sb.table("feedback").select("*").order("created_at", desc=True).execute().data or []
+    # Enrich with user info
+    user_ids = list({f["user_id"] for f in feedbacks})
+    if user_ids:
+        users = sb.table("users").select("user_id, name, picture").in_("user_id", user_ids).execute().data or []
+        umap = {u["user_id"]: u for u in users}
+        for f in feedbacks:
+            u = umap.get(f["user_id"], {})
+            f["user_name"] = u.get("name") or "Unknown"
+            f["user_picture"] = u.get("picture") or ""
+    return feedbacks
+
+
 # ---------- Mount router ----------
 app.include_router(api_router)
 
