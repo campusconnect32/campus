@@ -646,18 +646,39 @@ def signup_email(payload: dict, request: Request):
     threading.Thread(target=send_email, args=(email, "Verify your email", body)).start()
     return {"ok": True, "message": "Account created. Check your email."}
 
+
+
+
 @api_router.post("/auth/login")
 def login_email(payload: dict, request: Request, response: Response):
     email = payload.get("email", "").strip().lower()
     password = payload.get("password", "")
     if not email or not password:
         raise HTTPException(400, "Email and password required")
+
     user = _maybe(sb.table("users").select("*").eq("email", email).eq("deleted", False).maybe_single().execute())
-    if not user or not user.get("password_hash"):
-        raise HTTPException(401, "Invalid credentials")
-    if not bcrypt.checkpw(password[:72].encode("utf-8"), user["password_hash"].encode()):
+    if not user:
         raise HTTPException(401, "Invalid credentials")
 
+    password_hash = user.get("password_hash")
+    # Reject empty or missing password_hash (Google OAuth users, etc.)
+    if not password_hash:
+        logger.warning(f"Login attempt for email {email} with no password hash set")
+        raise HTTPException(401, "Invalid credentials")
+
+    # Ensure we have a valid bcrypt hash ($2b$ / $2a$ prefix)
+    if not password_hash.startswith(("$2b$", "$2a$", "$2y$")):
+        logger.error(f"Invalid bcrypt hash for user {email}")
+        raise HTTPException(401, "Invalid credentials")
+
+    try:
+        if not bcrypt.checkpw(password[:72].encode("utf-8"), password_hash.encode("utf-8")):
+            raise HTTPException(401, "Invalid credentials")
+    except ValueError as e:
+        logger.error(f"Bcrypt check failed for {email}: {e}")
+        raise HTTPException(401, "Invalid credentials")
+
+    # --- Email verification (unchanged) ---
     if not user.get("email_verified"):
         new_token = uuid.uuid4().hex
         new_expires = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
@@ -672,6 +693,7 @@ def login_email(payload: dict, request: Request, response: Response):
 
         raise HTTPException(403, "Your email is not verified. A new verification link has been sent to your inbox.")
 
+    # --- Normal login flow ---
     session_token = f"session_{uuid.uuid4().hex[:32]}"
     expires_at = datetime.now(timezone.utc) + timedelta(days=7)
     sb.table("user_sessions").upsert({
@@ -686,7 +708,6 @@ def login_email(payload: dict, request: Request, response: Response):
         samesite="lax", path="/", max_age=7*24*60*60
     )
     return {"ok": True, "user_id": user["user_id"], "token": session_token}
-
 @api_router.post("/auth/verify-email")
 def verify_email(payload: dict):
     token = payload.get("token", "")
@@ -2982,4 +3003,65 @@ app.include_router(api_router)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))   
+    
+    
+@api_router.post("/auth/login")
+def login_email(payload: dict, request: Request, response: Response):
+    email = payload.get("email", "").strip().lower()
+    password = payload.get("password", "")
+    if not email or not password:
+        raise HTTPException(400, "Email and password required")
+
+    user = _maybe(sb.table("users").select("*").eq("email", email).eq("deleted", False).maybe_single().execute())
+    if not user:
+        raise HTTPException(401, "Invalid credentials")
+
+    password_hash = user.get("password_hash")
+    # Reject empty or missing password_hash (Google OAuth users, etc.)
+    if not password_hash:
+        logger.warning(f"Login attempt for email {email} with no password hash set")
+        raise HTTPException(401, "Invalid credentials")
+
+    # Ensure we have a valid bcrypt hash ($2b$ / $2a$ prefix)
+    if not password_hash.startswith(("$2b$", "$2a$", "$2y$")):
+        logger.error(f"Invalid bcrypt hash for user {email}")
+        raise HTTPException(401, "Invalid credentials")
+
+    try:
+        if not bcrypt.checkpw(password[:72].encode("utf-8"), password_hash.encode("utf-8")):
+            raise HTTPException(401, "Invalid credentials")
+    except ValueError as e:
+        logger.error(f"Bcrypt check failed for {email}: {e}")
+        raise HTTPException(401, "Invalid credentials")
+
+    # --- Email verification (unchanged) ---
+    if not user.get("email_verified"):
+        new_token = uuid.uuid4().hex
+        new_expires = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+        sb.table("users").update({
+            "verification_token": new_token,
+            "verification_token_expires": new_expires
+        }).eq("user_id", user["user_id"]).execute()
+
+        verify_link = f"https://campusconnect-app-32.web.app/verify-email?token={new_token}"
+        body = f"<h2>Email Verification</h2><p>Click to verify: <a href='{verify_link}'>{verify_link}</a></p>"
+        threading.Thread(target=send_email, args=(email, "Verify your email", body)).start()
+
+        raise HTTPException(403, "Your email is not verified. A new verification link has been sent to your inbox.")
+
+    # --- Normal login flow ---
+    session_token = f"session_{uuid.uuid4().hex[:32]}"
+    expires_at = datetime.now(timezone.utc) + timedelta(days=7)
+    sb.table("user_sessions").upsert({
+        "session_token": session_token, "user_id": user["user_id"],
+        "expires_at": expires_at.isoformat(), "created_at": datetime.now(timezone.utc).isoformat()
+    }).execute()
+    sb.table("users").update({"last_active": datetime.now(timezone.utc).isoformat()}).eq("user_id", user["user_id"]).execute()
+
+    response.set_cookie(
+        key="session_token", value=session_token,
+        httponly=True, secure=request.url.scheme == "https",
+        samesite="lax", path="/", max_age=7*24*60*60
+    )
+    return {"ok": True, "user_id": user["user_id"], "token": session_token}    
